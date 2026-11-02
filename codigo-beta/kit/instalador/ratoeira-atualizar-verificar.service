@@ -1,0 +1,12 @@
+# Pergunta uma vez por dia ao repositório do produto se o canal tem versão nova (não instala nada: só grava o
+# estado, que a tela de Atualizações mostra com a bolinha). Ligada pelo timer de mesmo nome ou pelo gateway.
+[Unit]
+Description=Ratoeira - ver se tem versão nova
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=RATOEIRA_CONFIG=/etc/ratoeira/gateway.config.json
+ExecStart=/usr/local/sbin/ratoeira-atualizar verificar
+TimeoutStartSec=300

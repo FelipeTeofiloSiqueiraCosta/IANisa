@@ -75,3 +75,5 @@ Os testes cobrem acesso, persistência, uploads, revisão do perfil, estados de 
 
 O servidor escuta somente em loopback. Publicação HTTPS, compartilhamento externo e isolamento de CLIs entre instalações precisam ser configurados para a VPS. As APIs de convites permanecem disponíveis no backend; a gestão visual anterior foi preservada em `apresentacao/referencia/` para implementação posterior.
 # IANisa
+# IANisa
+# IANisa

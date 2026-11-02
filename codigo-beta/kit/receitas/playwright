@@ -1,0 +1,57 @@
+#!/bin/bash
+# Navegador pros agentes da Ratoeira: Playwright + Chromium, Google Chrome e o playwright-cli, pra todo mundo.
+# Receita: roda como root pelo chat de um admin (rodar_receita, nome "playwright", args ["1.62.0"] pra trocar a
+# versão da biblioteca, ["1.62.0", "0.1.23"] pra trocar também a do playwright-cli) ou à mão:
+# sudo ./playwright [versão da biblioteca] [versão do playwright-cli]
+# - biblioteca em /opt/ratoeira/playwright/node_modules: o NODE_PATH da unit dos agentes e do ratoeira-cron aponta
+#   pra lá (require de qualquer pasta), e /node_modules/playwright aponta pra ela, porque o import (ESM) não lê o
+#   NODE_PATH e sobe de pasta em pasta atrás de node_modules até a raiz
+# - comandos `playwright` e `playwright-cli` em /opt/ratoeira/bin (já está no PATH dos agentes e das automações)
+# - Chromium da biblioteca em /opt/ratoeira/ms-playwright, só leitura pra todos (PLAYWRIGHT_BROWSERS_PATH)
+# - Google Chrome (pacote do apt, se atualiza com o sistema): é o navegador do playwright-cli. O Chromium da
+#   biblioteca não serve pra ele: o cli traz uma versão própria do Playwright, que pede outra revisão, e no
+#   Ubuntu 24.04 o sandbox do Chromium só funciona no Chrome, que tem perfil do AppArmor (/etc/apparmor.d/chrome)
+# - playwright-cli numa pasta própria (/opt/ratoeira/playwright-cli), pra versão dele não se misturar com a da
+#   biblioteca. A skill que ensina o agente a usar vem do produto (kit/skills/navegador-ratoeira)
+# Projeto com Playwright próprio no node_modules usa o dele; se for de outra versão, o navegador dela não
+# está na pasta compartilhada e `playwright install` não grava lá: alinhar a versão do projeto com esta.
+set -euo pipefail
+VERSAO="${1:-1.61.1}"
+VERSAO_CLI="${2:-0.1.22}"
+for v in "$VERSAO" "$VERSAO_CLI"; do
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Versão inválida: $v"; exit 1; }
+done
+[ "$(id -u)" = 0 ] || { echo "Rode com sudo."; exit 1; }
+LIB=/opt/ratoeira/playwright
+CLI=/opt/ratoeira/playwright-cli
+NAVEGADORES=/opt/ratoeira/ms-playwright
+install -d -m 755 "$LIB" "$CLI" "$NAVEGADORES" /opt/ratoeira/bin
+cd "$LIB"
+[ -f package.json ] || echo '{"name":"ratoeira-playwright","private":true}' > package.json
+npm install --no-audit --no-fund --save-exact "playwright@$VERSAO"
+# --with-deps instala as bibliotecas do sistema que o Chromium pede (apt)
+PLAYWRIGHT_BROWSERS_PATH="$NAVEGADORES" "$LIB/node_modules/.bin/playwright" install --with-deps chromium
+ln -sfn "$LIB/node_modules/.bin/playwright" /opt/ratoeira/bin/playwright
+# import 'playwright' de qualquer pasta (ver o cabeçalho). Só o pacote, nada mais na raiz
+install -d -m 755 /node_modules
+ln -sfn "$LIB/node_modules/playwright" /node_modules/playwright
+# Google Chrome: o instalador do Playwright baixa o .deb oficial e põe o repositório do Google no apt
+[ -x /opt/google/chrome/chrome ] || "$LIB/node_modules/.bin/playwright" install --with-deps chrome
+cd "$CLI"
+[ -f package.json ] || echo '{"name":"ratoeira-playwright-cli","private":true}' > package.json
+npm install --no-audit --no-fund --save-exact "@playwright/cli@$VERSAO_CLI"
+ln -sfn "$CLI/node_modules/.bin/playwright-cli" /opt/ratoeira/bin/playwright-cli
+chmod -R a+rX "$LIB" "$CLI" "$NAVEGADORES"
+# confere como alguém sem privilégio, do jeito que o agente vai usar: require, import e o cli
+T=$(mktemp -d); chmod 777 "$T"
+runuser -u nobody -- env -C "$T" PLAYWRIGHT_BROWSERS_PATH="$NAVEGADORES" NODE_PATH="$LIB/node_modules" HOME="$T" \
+  node -e "require('playwright').chromium.launch().then(async b=>{console.log('require: Chromium', b.version(), 'ok');await b.close()})"
+echo "import {chromium} from 'playwright'; const b=await chromium.launch(); console.log('import: ok'); await b.close();" > "$T/t.mjs"
+runuser -u nobody -- env -C "$T" PLAYWRIGHT_BROWSERS_PATH="$NAVEGADORES" HOME="$T" node t.mjs
+# o cli: abre o Chrome (com sandbox), lê a página e fecha. Falhou = a receita falha
+runuser -u nobody -- env -C "$T" HOME="$T" PATH="/opt/ratoeira/bin:$PATH" bash -c \
+  'trap "playwright-cli close >/dev/null 2>&1" EXIT; playwright-cli open "data:text/html,<title>ok</title>" >/dev/null && playwright-cli eval "document.title" | grep -q ok' \
+  || { echo "PAREI: o playwright-cli não abriu o Chrome."; rm -rf "$T"; exit 1; }
+echo "playwright-cli: $(/opt/google/chrome/chrome --version 2>/dev/null) ok"
+rm -rf "$T"
+echo "Pronto. Vale pra cada pessoa quando o servidor de agentes dela religar (sai sozinho depois de 30 min parado)."

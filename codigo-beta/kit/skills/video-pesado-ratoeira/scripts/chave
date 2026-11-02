@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Acha uma chave pra skill video-pesado-ratoeira e imprime o valor (nunca mostra no chat: usa dentro de $(...)).
+# Uso: bash chave NOME     ex.: bash chave RENDI_API_KEY
+# Procura, nessa ordem: variável de ambiente, ~/.config/ratoeira/chaves.env (da pessoa), .env na raiz da
+# pasta de trabalho (do time). O valor pode ser cru ou uma referência op://, que vira o valor pelo 1Password.
+# Sai com 1 (e uma linha no stderr) quando não acha: o degrau que precisa dela é pulado.
+set -u
+nome=${1:?uso: chave NOME}
+val=${!nome:-}
+
+if [ -z "$val" ]; then
+  raiz=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+  for arq in "$HOME/.config/ratoeira/chaves.env" "$raiz/.env"; do
+    [ -f "$arq" ] || continue
+    linha=$(grep -E "^(export )?$nome=" "$arq" | tail -1)
+    [ -n "$linha" ] || continue
+    val=${linha#*=}
+    val=${val%\"}; val=${val#\"}; val=${val%\'}; val=${val#\'}
+    [ -n "$val" ] && break
+  done
+fi
+
+if [ -z "$val" ]; then
+  echo "sem $nome (nem no ambiente, nem em ~/.config/ratoeira/chaves.env, nem no .env da pasta)" >&2
+  exit 1
+fi
+
+case "$val" in
+  op://*)
+    if ! command -v op >/dev/null; then
+      echo "$nome aponta pro 1Password ($val), mas o comando op não está instalado" >&2; exit 1
+    fi
+    if ! op read "$val" 2>/dev/null; then
+      echo "$nome aponta pro 1Password, mas o op não leu $val (cofre desligado ou caminho errado)" >&2; exit 1
+    fi
+    ;;
+  *) printf '%s\n' "$val" ;;
+esac

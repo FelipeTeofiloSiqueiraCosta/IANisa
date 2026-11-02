@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Playground da Ratoeira (13/10/2026), como root, de 1 em 1 minuto (ratoeira-playground.timer).
+
+- Lê os containers com a etiqueta ratoeira.play=<nome> (docker inspect + docker stats) e grava o estado que a tela
+  de Apps mostra: ligado/desligado, memória e CPU de cada experimento. Arquivo do grupo do gateway, só leitura.
+- Desliga (docker stop, não apaga) o experimento que ficou DIAS sem ninguém abrir. A conta usa o último acesso que o
+  gateway grava (playground-acessos.json) ou, se for mais recente, a hora em que o container ligou. Etiqueta
+  ratoeira.manter=sim deixa de fora (ex.: um webhook que quase ninguém abre pelo navegador).
+
+Instalado pela receita kit/receitas/playground. Caminhos e prazo vêm do ambiente (unit ratoeira-playground.service).
+"""
+import datetime, grp, json, os, re, subprocess, sys
+
+ESTADO = os.environ.get("RATOEIRA_PLAYGROUND_ESTADO", "/var/lib/ratoeira/playground/estado.json")
+ACESSOS = os.environ.get("RATOEIRA_PLAYGROUND_ACESSOS", "/var/lib/ratoeira/gateway-estado/playground-acessos.json")
+GRUPO = os.environ.get("RATOEIRA_GRUPO", "ratoeira-gw")
+DIAS = float(os.environ.get("RATOEIRA_PLAYGROUND_DIAS", "7"))
+
+agora = datetime.datetime.now(datetime.timezone.utc)
+iso = lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def docker(*args):
+    r = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "docker falhou")
+    return r.stdout
+
+
+def data(texto):
+    # 2026-10-13T19:04:12.123456789Z → datetime (o docker manda nanossegundos)
+    if not texto or texto.startswith("0001-"):
+        return None
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", texto)
+    return datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc) if m else None
+
+
+def mb(texto):
+    # "120.5MiB / 512MiB" → 120.5
+    m = re.match(r"([\d.]+)\s*([KMG]i?B|B)", texto or "")
+    if not m:
+        return None
+    n, u = float(m.group(1)), m.group(2)
+    return round(n / 1024 if u.startswith("K") else n * 1024 if u.startswith("G") else n / 1048576 if u == "B" else n, 1)
+
+
+def ler(arq, padrao):
+    try:
+        with open(arq) as f:
+            return json.load(f)
+    except Exception:
+        return padrao
+
+
+def main():
+    anterior = ler(ESTADO, {})
+    desligados = anterior.get("desligados", {})
+    ids = docker("ps", "-aq", "--filter", "label=ratoeira.play").split()
+    containers = []
+    if ids:
+        for c in json.loads(docker("inspect", *ids)):
+            lab = c.get("Config", {}).get("Labels") or {}
+            containers.append({
+                "id": c["Id"][:12], "container": c.get("Name", "").lstrip("/"), "nome": lab.get("ratoeira.play", ""),
+                "estado": c.get("State", {}).get("Status", ""), "ligou": c.get("State", {}).get("StartedAt", ""),
+                "manter": lab.get("ratoeira.manter", "") in ("sim", "true", "1"), "imagem": c.get("Config", {}).get("Image", ""),
+            })
+        rodando = [c["id"] for c in containers if c["estado"] == "running"]
+        if rodando:
+            for linha in docker("stats", "--no-stream", "--format", "{{json .}}", *rodando).splitlines():
+                s = json.loads(linha)
+                for c in containers:
+                    if s.get("ID", "").startswith(c["id"]) or s.get("Name") == c["container"]:
+                        c["memoriaMB"] = mb(s.get("MemUsage", "").split("/")[0])
+                        try:
+                            c["cpu"] = float(s.get("CPUPerc", "0").rstrip("%"))
+                        except ValueError:
+                            c["cpu"] = None
+
+    # desliga o que ficou DIAS sem acesso
+    acessos = ler(ACESSOS, {})
+    for nome in sorted({c["nome"] for c in containers if c["estado"] == "running" and c["nome"]}):
+        dele = [c for c in containers if c["nome"] == nome]
+        if any(c["manter"] for c in dele):
+            continue
+        refs = [data(acessos.get(nome))] + [data(c["ligou"]) for c in dele if c["estado"] == "running"]
+        refs = [r for r in refs if r]
+        if refs and (agora - max(refs)).total_seconds() > DIAS * 86400:
+            try:
+                docker("stop", *[c["id"] for c in dele if c["estado"] == "running"])
+                desligados[nome] = iso(agora)
+                for c in dele:
+                    c["estado"] = "exited"
+                print(f"{nome}: {DIAS:g} dias sem acesso, desliguei")
+            except RuntimeError as e:
+                print(f"{nome}: não consegui desligar ({e})", file=sys.stderr)
+
+    nomes = {c["nome"] for c in containers}
+    desligados = {k: v for k, v in desligados.items() if k in nomes}
+    os.makedirs(os.path.dirname(ESTADO), exist_ok=True)
+    tmp = ESTADO + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"em": iso(agora), "dias": DIAS, "containers": containers, "desligados": desligados}, f, indent=1)
+    gid = grp.getgrnam(GRUPO).gr_gid
+    os.chown(tmp, 0, gid)
+    os.chmod(tmp, 0o640)
+    os.replace(tmp, ESTADO)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+# Publica um app: ratoeira-publicar@<nome>.service
+# O gateway grava o pedido (<pedidos>/<nome>.json) e dá "start" nesta unit (regra do polkit). Roda o
+# publicar-app como root e termina; o resultado vai pra <pedidos>/<nome>.resultado.json.
+# Caminhos desta máquina num drop-in (ratoeira-publicar@.service.d/local.conf):
+#   RATOEIRA_PEDIDOS, RATOEIRA_CONFIG, RATOEIRA_GRUPO_GATEWAY
+[Unit]
+Description=Ratoeira - publicar o app %i
+
+[Service]
+Type=oneshot
+Environment=RATOEIRA_PEDIDOS=/var/lib/ratoeira/gateway-estado/publicar
+Environment=RATOEIRA_CONFIG=/etc/ratoeira/gateway.config.json
+Environment=RATOEIRA_GRUPO_GATEWAY=ratoeira-gateway
+ExecStart=/usr/local/sbin/ratoeira-publicar-app %i
+# instalar pacote e preparar (venv, Chromium) pode levar minutos
+TimeoutStartSec=1800

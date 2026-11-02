@@ -1,0 +1,14 @@
+{
+  "claude": {
+    "nome": "Claude Code",
+    "comando": "node_modules/.bin/claude-agent-acp",
+    "env": {"CLAUDE_CODE_EXECUTABLE": "/opt/ratoeira/bin/claude", "CLAUDE_CODE_ARTIFACT": "1", "CLAUDE_CODE_ARTIFACT_AUTO_OPEN": "0", "ENABLE_CLAUDEAI_MCP_SERVERS": "true"},
+    "modoAutomatico": "auto"
+  },
+  "codex": {
+    "nome": "Codex",
+    "comando": "node_modules/.bin/codex-acp",
+    "env": {"CODEX_PATH": "/opt/ratoeira/bin/codex", "NO_BROWSER": "1"},
+    "modoAutomatico": "agent"
+  }
+}

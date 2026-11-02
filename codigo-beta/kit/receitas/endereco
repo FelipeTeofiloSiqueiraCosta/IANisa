@@ -1,0 +1,108 @@
+#!/bin/bash
+# Troca o endereço da Ratoeira e/ou o dos Publicados por um domínio da pessoa (Configurações › Endereços,
+# docs/2026-10-17-boas-vindas.md). Roda como root, pelo agente de quem administra, depois que ela pediu e conferiu o DNS:
+#   sudo bash <fonte>/kit/receitas/endereco [--ratoeira novo.dominio] [--publicados apps.novo.dominio] [--conferir]
+# --conferir só mostra o que faria (DNS, endereços de antes e depois) e não mexe em nada.
+# O que faz, nesta ordem, parando no primeiro erro:
+#   1. confere no DNS público que cada nome novo aponta pro IP desta VPS;
+#   2. guarda cópia da config do gateway, do Caddyfile e do endereço dos Publicados (…/<arquivo>.antes-<data>);
+#   3. refaz o Caddyfile (o endereço antigo da Ratoeira passa a levar pro novo) e espera o HTTPS do nome novo responder;
+#      se não responder em 3 minutos, volta o Caddyfile de antes e para, sem ter mexido na config;
+#   4. grava o endereço novo na config do gateway e/ou no estado dos Publicados e religa o gateway (uns segundos fora).
+# Idempotente: rodar de novo com o mesmo nome não muda nada.
+set -euo pipefail
+[ "$(id -u)" = 0 ] || { echo "Rode com sudo."; exit 1; }
+CONFIG=/etc/ratoeira/gateway.config.json
+CADDY=/etc/caddy/Caddyfile
+[ -f "$CONFIG" ] || { echo "PAREI: não achei $CONFIG (esta máquina tem a Ratoeira instalada pelo instalador?)."; exit 1; }
+NOVO_R="" NOVO_P="" CONFERIR=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ratoeira) NOVO_R="${2:-}"; shift 2;;
+    --publicados) NOVO_P="${2:-}"; shift 2;;
+    --conferir) CONFERIR=1; shift;;
+    *) echo "Uso: endereco [--ratoeira nome] [--publicados nome] [--conferir]"; exit 2;;
+  esac
+done
+[ -n "$NOVO_R$NOVO_P" ] || { echo "Uso: endereco [--ratoeira nome] [--publicados nome] [--conferir]"; exit 2; }
+NOME_OK='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+for n in $NOVO_R $NOVO_P; do [[ "$n" =~ $NOME_OK ]] || { echo "PAREI: \"$n\" não é um endereço válido (só o nome, sem https:// nem caminho)."; exit 1; }; done
+
+campo(){ python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."): d=(d or {}).get(k) if isinstance(d,dict) else None
+print(d if isinstance(d,(str,int)) else "")' "$1" "$2"; }
+FONTE=${RATOEIRA_FONTE:-$(campo "$CONFIG" core.fonte)}
+[ -d "$FONTE/kit/instalador" ] || { echo "PAREI: não achei a fonte do núcleo ($FONTE)."; exit 1; }
+ATUAL_R=$(campo "$CONFIG" hostname); PORTA=$(campo "$CONFIG" port); PORTA=${PORTA:-6768}
+DADOS=$(campo "$CONFIG" portal.dataDir); DADOS=${DADOS:-/var/lib/ratoeira/gateway-estado}
+GW_USER=$(stat -c %U "$DADOS")
+PG="$DADOS/playground.json"; ATUAL_P=""; [ -f "$PG" ] && ATUAL_P=$(campo "$PG" base)
+FIM_R=${NOVO_R:-$ATUAL_R}; FIM_P=${NOVO_P:-$ATUAL_P}
+[ -n "$FIM_R" ] || { echo "PAREI: a config não tem o endereço da Ratoeira (hostname)."; exit 1; }
+[ "$FIM_R" != "$FIM_P" ] || { echo "PAREI: a Ratoeira e os Publicados precisam de endereços diferentes."; exit 1; }
+
+# DNS público (o /etc/hosts da Hostinger aponta o nome da VPS pra 127.0.1.1 e engana o getent)
+IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+ips_de(){ curl -fsS --max-time 8 -H 'accept: application/dns-json' "https://cloudflare-dns.com/dns-query?name=$1&type=A" 2>/dev/null \
+  | python3 -c 'import json,sys; print(" ".join(a["data"] for a in json.load(sys.stdin).get("Answer",[]) if a.get("type")==1))' 2>/dev/null || true; }
+FALHOU=0
+for n in $NOVO_R $NOVO_P; do
+  IPS=$(ips_de "$n")
+  if [[ " $IPS " == *" $IP "* ]]; then echo "DNS ok: $n → $IP"
+  else echo "DNS não aponta: $n → ${IPS:-nada} (esta VPS é $IP). Falta um registro A de $n pra $IP (na Cloudflare, com a nuvem cinza, só DNS)."; FALHOU=1; fi
+done
+echo "Ratoeira:   ${ATUAL_R} → ${FIM_R}"
+echo "Publicados: ${ATUAL_P:-nenhum} → ${FIM_P:-nenhum}"
+[ "$FALHOU" = 0 ] || { echo "PAREI: arruma o DNS e roda de novo (pode levar de minutos a horas pra propagar)."; exit 1; }
+[ "$CONFERIR" = 0 ] || { echo "Só conferi: nada mudou."; exit 0; }
+if [ "$FIM_R" = "$ATUAL_R" ] && [ "$FIM_P" = "$ATUAL_P" ]; then echo "Já está assim: nada a fazer."; exit 0; fi
+
+# 2. cópias de antes
+QUANDO=$(date -u +%Y%m%dT%H%M%SZ)
+cp -a "$CONFIG" "$CONFIG.antes-$QUANDO"
+[ -f "$CADDY" ] && cp -a "$CADDY" "$CADDY.antes-$QUANDO"
+[ -f "$PG" ] && cp -a "$PG" "$PG.antes-$QUANDO"
+echo "Cópias de antes: $CONFIG.antes-$QUANDO, $CADDY.antes-$QUANDO${ATUAL_P:+, $PG.antes-$QUANDO}"
+
+# 3. Caddy (o gerador vem do último commit da fonte, como nas outras receitas)
+GER=$(mktemp); trap 'rm -f "$GER"' EXIT
+pref=$(git -c safe.directory='*' -C "$FONTE" rev-parse --show-prefix 2>/dev/null || true)
+git -c safe.directory='*' -C "$FONTE" show "HEAD:${pref}kit/instalador/caddyfile.mjs" > "$GER" 2>/dev/null || cp "$FONTE/kit/instalador/caddyfile.mjs" "$GER"
+ANTIGO=""; [ "$FIM_R" != "$ATUAL_R" ] && [ -n "$ATUAL_R" ] && [ "$ATUAL_R" != "$FIM_P" ] && ANTIGO=$ATUAL_R
+node "$GER" --endereco "$FIM_R" --porta "$PORTA" ${FIM_P:+--publicados "$FIM_P"} ${ANTIGO:+--antigo "$ANTIGO"} > "$CADDY.novo"
+caddy validate --config "$CADDY.novo" --adapter caddyfile >/dev/null 2>&1 || { rm -f "$CADDY.novo"; echo "PAREI: o Caddyfile novo não passou na conferência do Caddy. Nada mudou."; exit 1; }
+mv -f "$CADDY.novo" "$CADDY"; systemctl reload-or-restart caddy
+OK=0
+# a Ratoeira responde o health; nos Publicados basta o HTTPS fechar (a raiz pode dar 404)
+for i in $(seq 1 60); do
+  if curl -fsS --max-time 5 -o /dev/null "https://$FIM_R/_ratoeira/health" && { [ -z "$NOVO_P" ] || curl -sS --max-time 5 -o /dev/null "https://$FIM_P/"; }; then OK=1; break; fi; sleep 3
+done
+if [ "$OK" = 0 ]; then
+  cp -a "$CADDY.antes-$QUANDO" "$CADDY"; systemctl reload-or-restart caddy
+  echo "PAREI: o HTTPS de https://$FIM_R${NOVO_P:+ ou de https://$FIM_P} não respondeu em 3 minutos (certificado? firewall do painel do provedor com 80 e 443 fechadas? journalctl -u caddy). Voltei o Caddyfile de antes; a config não foi mexida."; exit 1
+fi
+echo "HTTPS ok em https://$FIM_R"
+
+# 4. config e Publicados, e religa o gateway
+if [ "$FIM_R" != "$ATUAL_R" ]; then
+  python3 - "$CONFIG" "$FIM_R" <<'PY'
+import json,os,sys
+arq,novo=sys.argv[1],sys.argv[2]
+d=json.load(open(arq)); d['hostname']=novo
+st=os.stat(arq); tmp=arq+'.novo'
+with open(tmp,'w') as f: json.dump(d,f,indent=2,ensure_ascii=False); f.write('\n')
+os.chown(tmp,st.st_uid,st.st_gid); os.chmod(tmp,st.st_mode&0o777); os.replace(tmp,arq)
+PY
+fi
+if [ -n "$NOVO_P" ] && [ "$FIM_P" != "$ATUAL_P" ]; then
+  python3 - "$PG" "$FIM_P" <<'PY' | runuser -u "$GW_USER" -- sh -c 'umask 077; cat > "$1.novo" && mv -f "$1.novo" "$1"' sh "$PG"
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except FileNotFoundError: d={}
+d['base']=sys.argv[2]; print(json.dumps(d,ensure_ascii=False))
+PY
+fi
+systemctl restart ratoeira-gateway
+for i in $(seq 1 20); do curl -fsS --max-time 3 -o /dev/null "https://$FIM_R/_ratoeira/health" && break; sleep 2; done
+curl -fsS --max-time 5 -o /dev/null "https://$FIM_R/_ratoeira/health" || { echo "FALHOU: o gateway não voltou (journalctl -u ratoeira-gateway). Pra desfazer: cp $CONFIG.antes-$QUANDO $CONFIG e cp $CADDY.antes-$QUANDO $CADDY, reload do caddy e restart do ratoeira-gateway."; exit 1; }
+echo "Pronto. Ratoeira em https://$FIM_R${FIM_P:+ · Publicados em https://$FIM_P}${ANTIGO:+ (https://$ANTIGO leva pro novo)}"

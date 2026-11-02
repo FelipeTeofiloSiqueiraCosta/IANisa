@@ -1,0 +1,33 @@
+#!/bin/sh
+# Navegador da Ratoeira da pessoa (ratoeira-navegador@<usuário>.service, agentes/navegador.mjs).
+#   ratoeira-navegador          liga se precisar e escreve o endereço pro playwright-cli:
+#                               playwright-cli -s=<sessão> attach --endpoint="$(ratoeira-navegador)"
+#   ratoeira-navegador estado   ligado ou desligado (e desde quando)
+#   ratoeira-navegador fechar   fecha agora (grava o login antes); o próximo pedido liga de novo
+# O endereço muda a cada vez que o navegador liga: pedir de novo depois que ele fechou.
+set -eu
+u=$(id -un)
+unit="ratoeira-navegador@$u.service"
+estado="/run/ratoeira-navegador-$u/estado.json"
+campo() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" "$estado" 2>/dev/null; }
+case "${1:-endereco}" in
+  endereco)
+    if ! systemctl is-active -q "$unit"; then
+      systemctl start --no-ask-password "$unit" || { echo "não consegui ligar o navegador ($unit)" >&2; exit 1; }
+    fi
+    i=0
+    while [ ! -s "$estado" ]; do
+      i=$((i + 1))
+      case "$(systemctl is-active "$unit")" in failed|inactive) parou=1 ;; *) parou= ;; esac
+      if [ $i -gt 60 ] || [ -n "$parou" ]; then
+        echo "o navegador não subiu; log: journalctl -u $unit -n 30" >&2; exit 1
+      fi
+      sleep 0.5
+    done
+    campo endpoint ;;
+  estado)
+    if [ -s "$estado" ]; then echo "ligado desde $(campo desde)"; else echo "desligado"; fi ;;
+  fechar)
+    systemctl stop --no-ask-password "$unit" && echo "fechado" ;;
+  *) echo "uso: ratoeira-navegador [endereco|estado|fechar]" >&2; exit 2 ;;
+esac

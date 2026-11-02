@@ -1,0 +1,52 @@
+#!/bin/bash
+# Instala (ou atualiza) o backup da máquina: restic criptografado pra fora da VPS, uma vez por dia, com cópia
+# consistente de todo SQLite. Fonte em kit/backup/ (lida do último commit). Receita: roda como root pelo chat de um admin
+# (rodar_receita, nome "backup") ou à mão: sudo ./backup
+# Só troca o código, pra máquina onde o backup foi montado à mão (a nossa). Nas instalações dos alunos, desde
+# 28/10/2026, o código e as units vêm pelo atualizador e quem configura é a tela (Configurações › Segurança).
+# Numa máquina sem a unit, a receita para e avisa, sem mexer em nada.
+# Com o argumento "agora", roda um backup na hora e mostra o resultado (pode levar uns minutos).
+set -euo pipefail
+[ "$(id -u)" = 0 ] || { echo "Rode com sudo."; exit 1; }
+systemctl cat ratoeira-backup.service >/dev/null 2>&1 && systemctl cat ratoeira-backup.timer >/dev/null 2>&1 \
+  || { echo "PAREI: o backup ainda não vem no produto. Falta a unit ratoeira-backup.service/.timer nesta máquina (e o restic configurado em /etc/ratoeira-backup); esta receita só atualiza o código de um backup já montado."; exit 1; }
+LIB=/usr/local/lib/ratoeira-backup
+# O rodar_receita só copia este script; o código vem do último commit (HEAD) da fonte do núcleo, como no publicar-core:
+# RATOEIRA_FONTE, quando quem chama passa (o instalador passa pras receitas), ou o "core.fonte" da config do gateway.
+FONTE=${RATOEIRA_FONTE:-$(python3 -c 'import json;print(json.load(open("/etc/ratoeira/gateway.config.json"))["core"]["fonte"])')}
+[ -d "$FONTE/kit/backup" ] || { echo "PAREI: não achei a fonte do núcleo ($FONTE)."; exit 1; }
+COPIA=$(mktemp -d)
+trap 'rm -rf "$COPIA"' EXIT
+pref=$(git -c safe.directory='*' -C "$FONTE" rev-parse --show-prefix)
+for f in backup.py sqlite_snapshot.py ratoeira-backup; do
+  git -c safe.directory='*' -C "$FONTE" show "HEAD:${pref}kit/backup/$f" > "$COPIA/$f" || { echo "Falta kit/backup/$f no último commit"; exit 1; }
+done
+command -v restic >/dev/null || { echo "PAREI: restic não instalado (apt install restic)."; exit 1; }
+[ -f /etc/ratoeira-backup/restic-env.json ] && [ -f /etc/ratoeira-backup/password ] \
+  || { echo "PAREI: sem /etc/ratoeira-backup configurado. Montar repositório e senha antes (à mão, como root)."; exit 1; }
+
+python3 -m py_compile "$COPIA/backup.py" "$COPIA/sqlite_snapshot.py"
+mkdir -p "$LIB"
+[ -f "$LIB/backup.py" ] && cp -p "$LIB/backup.py" "$LIB/backup.py.anterior"
+install -m 644 -o root -g root "$COPIA/backup.py" "$COPIA/sqlite_snapshot.py" "$LIB/"
+install -m 755 -o root -g root "$COPIA/ratoeira-backup" /usr/local/sbin/ratoeira-backup
+rm -rf "$LIB/__pycache__"
+echo "Código do backup instalado."
+
+# O estado que a tela de Segurança lê (sem segredo), do grupo do gateway
+GRUPO=$(stat -c %G /etc/ratoeira/apps.d 2>/dev/null || echo ratoeira-gw)
+RATOEIRA_GRUPO=$GRUPO /usr/local/sbin/ratoeira-backup tela >/dev/null || echo "aviso: não gravei o estado da tela"
+
+# Confere a pré-checagem (discos, bancos, contêineres) sem mandar nada pra fora.
+/usr/local/sbin/ratoeira-backup prepare
+
+if [ "${1:-}" = agora ]; then
+  echo "Rodando o backup agora..."
+  systemctl reset-failed ratoeira-backup.service 2>/dev/null || true
+  systemctl start ratoeira-backup.service || true
+fi
+
+echo "--- estado"
+systemctl is-active ratoeira-backup.service || true
+/usr/local/sbin/ratoeira-backup status | grep -E '"(status|last_success|snapshot|error|sqlite_count)"' || true
+systemctl list-timers ratoeira-backup.timer --no-pager | head -2

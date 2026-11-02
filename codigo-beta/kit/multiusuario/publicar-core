@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+"""Publica a própria Ratoeira (telas, gateway, servidor de agentes, texto dos agentes e scripts de root)
+a partir do repositório, sem sudo pra ninguém. Roda como root, pela unit ratoeira-publicar-core@<parte>,
+que o gateway liga (polkit) depois de gravar o pedido de um admin. Plano: docs/2026-10-09-publicar-core.md.
+
+Partes (só as que estiverem em "core.partes" da config do gateway):
+  telas    gateway/public (arquivos do git) → /opt/ratoeira/gateway/public. Não reinicia nada.
+  gateway  gateway inteiro: monta numa pasta de versão (npm ci + build:chat), aponta /opt/ratoeira/gateway
+           pra ela, reinicia o ratoeira-gateway e espera a saúde; não respondeu, aponta de volta pra anterior.
+  agentes  servidor de agentes, numa pasta de versão apontada por /opt/ratoeira/agentes. Vale quando o
+           servidor de cada pessoa religar (ele vigia o .versao pelo atalho). Antes, deixa o Claude Code e o
+           Codex de /opt/ratoeira/bin nas versões de agentes/clis.json (só troca o que mudou).
+  regras   kit/agentes.md, kit/ratoeira-instrucoes, APPS.md e as skills do produto (kit/skills) →
+           /usr/local/lib/ratoeira, e roda o ratoeira-instrucoes (texto fixo de todos os agentes e as skills
+           ligadas em cada pessoa e no Codex).
+  kit      scripts e units de kit/multiusuario → /usr/local/{sbin,lib/ratoeira,bin} e /etc/systemd/system.
+  receita  roda como root um script de kit/receitas/<nome> (instalar algo pra máquina toda: biblioteca,
+           navegador, CLI). O pedido diz qual e até 3 argumentos.
+  pacotes  apt-get install dos pacotes do pedido (nome de pacote Debian, até 20).
+
+Sempre:
+  - publica o que está commitado (HEAD). Mudança sem commit nos arquivos da parte: recusa e diz quais;
+  - o git e o npm rodam como o usuário do gateway, nunca como root (o repositório é gravável pelo time);
+  - gateway e agentes: cada publicação vira uma pasta em /opt/ratoeira/versoes/<parte>/<carimbo>-<commit>,
+    e /opt/ratoeira/<parte> é um atalho pra versão no ar. Ficam a do ar e as 3 anteriores; voltar é apontar
+    o atalho. Telas trocam arquivos dentro da versão no ar (o gateway serve a pasta da versão em que subiu);
+  - o resto guarda backup dos arquivos trocados; grava quem publicou.
+
+Fica de fora de propósito (vai pela sessão de root): a regra do polkit, este script e a unit dele (um erro
+neles tranca a porta de publicar), as units do gateway e do proxy da frente, e tudo em /etc/ratoeira.
+"""
+import fcntl, grp, hashlib, json, os, pwd, re, shutil, subprocess, sys, time, urllib.request
+from datetime import datetime, timezone
+
+PEDIDOS = os.environ.get("RATOEIRA_PEDIDOS_CORE", "/var/lib/ratoeira/gateway-estado/publicar-core")
+CONFIG = os.environ.get("RATOEIRA_CONFIG", "/etc/ratoeira/gateway.config.json")
+USUARIO_GW = os.environ.get("RATOEIRA_USUARIO_GATEWAY", "ratoeira-gateway")
+TRABALHO = os.environ.get("RATOEIRA_CORE_TRABALHO", "/var/lib/ratoeira/core")
+OPT = os.environ.get("RATOEIRA_OPT", "/opt/ratoeira")
+VERSOES = os.path.join(OPT, "versoes")
+GUARDAR = 3  # versões antigas que ficam, além da que está no ar
+LIB = os.environ.get("RATOEIRA_LIB", "/usr/local/lib/ratoeira")
+PARTES = ("telas", "gateway", "agentes", "regras", "kit", "receita", "pacotes")
+PUBLICAVEIS = ("telas", "gateway", "agentes", "regras", "kit")  # as que trocam código (o atualizador usa todas)
+
+# o que cada parte lê do repositório (caminhos relativos à pasta da Ratoeira, que pode ser uma subpasta do repositório)
+FONTES = {
+    "telas": ["gateway/public"],
+    "gateway": ["gateway"],
+    "agentes": ["agentes"],
+    "regras": ["kit/agentes.md", "kit/ratoeira-instrucoes", "APPS.md", "kit/skills"],
+    "kit": ["kit/multiusuario"],
+    "receita": ["kit/receitas"],
+}
+NOME_RECEITA = re.compile(r"^[a-z][a-z0-9-]{0,40}$")
+ARG_RECEITA = re.compile(r"^[A-Za-z0-9._@:/=+-]{1,100}$")
+PACOTE = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,60}$")
+REGRAS = {
+    "kit/agentes.md": "/usr/local/lib/ratoeira/agentes.md",
+    "kit/ratoeira-instrucoes": "/usr/local/lib/ratoeira/ratoeira-instrucoes",
+    "APPS.md": "/usr/local/lib/ratoeira/APPS.md",
+}
+KIT = {
+    "adicionar-pessoa.sh": "/usr/local/sbin/ratoeira-adicionar-pessoa",
+    "aplicar-acessos": "/usr/local/sbin/ratoeira-aplicar-acessos",
+    "automacoes": "/usr/local/sbin/ratoeira-automacoes",
+    "criar-area.sh": "/usr/local/sbin/ratoeira-criar-area",
+    "publicar-app": "/usr/local/sbin/ratoeira-publicar-app",
+    "commit-turno": "/usr/local/lib/ratoeira/commit-turno",
+    "conta-claude": "/usr/local/lib/ratoeira/conta-claude",
+    "ratoeira-cron": "/usr/local/bin/ratoeira-cron",
+    "ratoeira-rotina": "/usr/local/bin/ratoeira-rotina",
+    "managed-settings.json": "/etc/claude-code/managed-settings.json",
+    "ratoeira-acessos.service": "/etc/systemd/system/ratoeira-acessos.service",
+    "ratoeira-adicionar@.service": "/etc/systemd/system/ratoeira-adicionar@.service",
+    "ratoeira-agentes@.service": "/etc/systemd/system/ratoeira-agentes@.service",
+    "ratoeira-navegador@.service": "/etc/systemd/system/ratoeira-navegador@.service",
+    "ratoeira-navegador": "/usr/local/bin/ratoeira-navegador",
+    "ratoeira-app@.service": "/etc/systemd/system/ratoeira-app@.service",
+    "ratoeira-automacoes.service": "/etc/systemd/system/ratoeira-automacoes.service",
+    "ratoeira-automacoes.timer": "/etc/systemd/system/ratoeira-automacoes.timer",
+    "ratoeira-publicar@.service": "/etc/systemd/system/ratoeira-publicar@.service",
+    "playground": "/usr/local/sbin/ratoeira-playground",
+    "ratoeira-playground.service": "/etc/systemd/system/ratoeira-playground.service",
+    "ratoeira-playground.timer": "/etc/systemd/system/ratoeira-playground.timer",
+}
+# arquivos de kit/multiusuario que este script não instala: mudou, quem administra instala pela sessão de root
+FORA_DO_KIT = {"50-ratoeira.rules", "publicar-core", "ratoeira-publicar-core@.service", "README.md"}
+
+log_linhas = []
+
+
+def log(texto):
+    print(texto, flush=True)
+    log_linhas.append(texto)
+
+
+class Recusa(Exception):
+    pass
+
+
+def agora():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def gravar(caminho, texto, modo=0o644):
+    tmp = caminho + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(texto)
+    os.chmod(tmp, modo)
+    os.replace(tmp, caminho)
+
+
+def rodar(cmd, timeout=600, como=None, **kw):
+    """Roda e põe o fim da saída no log. como=usuário: roda como ele (runuser), nunca como root."""
+    if como:
+        cmd = [shutil.which("runuser") or "/usr/sbin/runuser", "-u", como, "--", *cmd]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
+    saida = (r.stdout + r.stderr).strip()
+    # barras de progresso de download (npm, playwright) só enchem o log
+    linhas = [l for l in saida.splitlines() if "■" not in l and not re.search(r"\|\s+\|\s+\d+% of", l)]
+    for linha in linhas[-30:]:
+        log("  " + linha)
+    return r
+
+
+def git(repo, *args, timeout=60):
+    """git como o usuário do gateway: config, filtros e ganchos do repositório nunca rodam como root."""
+    cmd = [shutil.which("runuser") or "/usr/sbin/runuser", "-u", USUARIO_GW, "--",
+           "git", "-c", "safe.directory=*", "-C", repo, *args]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def config_core(fonte_produto=None):
+    with open(CONFIG) as f:
+        cfg = json.load(f)
+    if fonte_produto:
+        # Quem chama é o atualizador (root, direto, nunca pelo pedido do gateway): publica todas as partes de
+        # código a partir do clone do produto, que mora fora das áreas (/opt/ratoeira/fonte).
+        fonte = os.path.realpath(fonte_produto)
+        if not os.path.isfile(os.path.join(fonte, "gateway", "main.mjs")):
+            raise Recusa(f"Não achei a Ratoeira em {fonte} (falta gateway/main.mjs).")
+        return cfg, fonte, list(PUBLICAVEIS)
+    core = cfg.get("core")
+    if not isinstance(core, dict):
+        raise Recusa('Esta Ratoeira não publica o próprio código ("core" falta na config do gateway).')
+    partes = [p for p in core.get("partes", []) if p in PARTES]
+    fonte = os.path.realpath(str(core.get("fonte", "")))
+    areas = [os.path.realpath(a["caminho"]) for a in cfg.get("areas") or [] if isinstance(a, dict) and a.get("caminho")]
+    if not any(fonte == a or fonte.startswith(a + "/") for a in areas):
+        raise Recusa('"core.fonte" precisa ficar dentro de uma área da Ratoeira.')
+    if not os.path.isfile(os.path.join(fonte, "gateway", "main.mjs")):
+        raise Recusa(f"Não achei a Ratoeira em {fonte} (falta gateway/main.mjs).")
+    return cfg, fonte, partes
+
+
+def conferir_git(fonte, parte):
+    """Commit da parte e mudanças sem commit. Recusa se tiver mudança: publica-se só o que está no git."""
+    caminhos = FONTES[parte]
+    r = git(fonte, "status", "--porcelain", "--untracked-files=all", "--", *caminhos)
+    if r.returncode != 0:
+        raise Recusa("O git não respondeu: " + (r.stderr.strip().splitlines() or ["?"])[-1])
+    sujos = [l[3:] for l in r.stdout.splitlines() if l.strip()]
+    if sujos:
+        mostra = ", ".join(sujos[:10]) + (f" e mais {len(sujos) - 10}" if len(sujos) > 10 else "")
+        raise Recusa(f"Tem mudança sem commit em {parte}: {mostra}. Commita (ou descarta) e publica de novo.")
+    c = git(fonte, "log", "-1", "--format=%h %s", "--", *caminhos).stdout.strip()
+    return c or "sem-commit"
+
+
+def extrair(fonte, parte, destino):
+    """git archive HEAD da parte → destino (pasta do usuário do gateway), tudo como ele."""
+    shutil.rmtree(destino, ignore_errors=True)
+    gw = pwd.getpwnam(USUARIO_GW)
+    os.makedirs(destino, mode=0o750)
+    os.chown(destino, gw.pw_uid, gw.pw_gid)
+    top = git(fonte, "rev-parse", "--show-prefix").stdout.strip()
+    caminhos = [top + c for c in FONTES[parte]]
+    raiz = git(fonte, "rev-parse", "--show-toplevel").stdout.strip()
+    script = 'git -c safe.directory="*" -C "$1" archive --format=tar HEAD -- "${@:3}" | tar -x -C "$2" --no-same-owner'
+    r = rodar(["bash", "-c", script, "extrair", raiz, destino, *caminhos], como=USUARIO_GW, timeout=120)
+    if r.returncode != 0:
+        raise Recusa("Não consegui tirar os arquivos do git (log acima).")
+    # o tar vem com o caminho dentro do repositório (<subpasta>/...): devolve a pasta da Ratoeira dentro do destino
+    return os.path.join(destino, top.rstrip("/")) if top else destino
+
+
+def dono_root(pasta):
+    """A cópia em produção é do root e só leitura pros outros: sem ACL, sem setgid, sem escrita do time."""
+    subprocess.run(["setfacl", "-R", "-b", "-k", pasta], capture_output=True)
+    subprocess.run(["chown", "-R", "root:root", pasta], check=True)
+    subprocess.run(["chmod", "-R", "u+rwX,go+rX,go-w,g-s", pasta], check=True)
+
+
+def npm(pasta, *args, timeout=900):
+    casa = os.path.join(TRABALHO, "npm-casa")
+    os.makedirs(casa, exist_ok=True)
+    gw = pwd.getpwnam(USUARIO_GW)
+    os.chown(casa, gw.pw_uid, gw.pw_gid)
+    # o runuser troca o HOME pelo do usuário: as variáveis vão pelo env, depois dele
+    env = ["PATH=/usr/local/bin:/usr/bin:/bin", f"HOME={casa}", f"npm_config_cache={casa}/cache", "LANG=C.UTF-8",
+           "npm_config_update_notifier=false"]
+    r = rodar(["env", "-i", *env, "npm", *args], como=USUARIO_GW, cwd=pasta, timeout=timeout)
+    if r.returncode != 0:
+        raise Recusa(f"npm {' '.join(args)} falhou (log acima). Nada mudou no que está no ar.")
+
+
+VERSAO_CLI = re.compile(r"^\d{1,4}\.\d{1,4}\.\d{1,6}$")
+CLAUDE_RELEASES = "https://downloads.claude.ai/claude-code-releases"
+# nome da plataforma no manifesto do Claude Code (o ARM ainda em teste)
+PLATAFORMA_CLAUDE = {"x86_64": "linux-x64", "aarch64": "linux-arm64"}.get(os.uname().machine, "linux-x64")
+
+
+def versao_cli(binario):
+    """A versão que o CLI diz ter (X.Y.Z), ou None se não roda."""
+    try:
+        r = subprocess.run([binario, "--version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"\d+\.\d+\.\d+", r.stdout or "")
+    return m.group(0) if m else None
+
+
+def baixar(url, timeout=300):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return r.read()
+
+
+def instalar_claude(v):
+    """Binário oficial do Claude Code na versão v, conferido pelo sha256 do manifesto, por cima do de OPT/bin."""
+    destino = os.path.join(OPT, "bin", "claude")
+    try:
+        soma = json.loads(baixar(f"{CLAUDE_RELEASES}/{v}/manifest.json", 60))["platforms"][PLATAFORMA_CLAUDE]["checksum"]
+    except Exception as e:
+        raise Recusa(f"Não consegui ler o manifesto do Claude Code {v} ({type(e).__name__}). Nada mudou no que está no ar.")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(soma)):
+        raise Recusa(f"O manifesto do Claude Code {v} veio sem sha256. Nada mudou no que está no ar.")
+    try:
+        dados = baixar(f"{CLAUDE_RELEASES}/{v}/{PLATAFORMA_CLAUDE}/claude")
+    except Exception as e:
+        raise Recusa(f"Não consegui baixar o Claude Code {v} ({type(e).__name__}). Nada mudou no que está no ar.")
+    if hashlib.sha256(dados).hexdigest() != soma:
+        raise Recusa(f"O Claude Code {v} baixado não confere com o manifesto. Nada mudou no que está no ar.")
+    novo = destino + ".novo"
+    with open(novo, "wb") as f:
+        f.write(dados)
+    os.chown(novo, 0, 0)
+    os.chmod(novo, 0o755)
+    if versao_cli(novo) != v:
+        os.remove(novo)
+        raise Recusa(f"O Claude Code {v} baixado não rodou. Nada mudou no que está no ar.")
+    os.replace(novo, destino)  # quem está rodando segue com o binário de antes até religar
+
+
+def instalar_codex(v):
+    """@openai/codex na versão v: o npm monta como o usuário do gateway, o root copia pra OPT/lib/node_modules.
+    O de antes fica em codex.anterior (conversa rodando segue com ele) até a próxima troca."""
+    montar = os.path.join(TRABALHO, "montar-codex")
+    shutil.rmtree(montar, ignore_errors=True)
+    os.makedirs(montar)
+    gw = pwd.getpwnam(USUARIO_GW)
+    os.chown(montar, gw.pw_uid, gw.pw_gid)
+    npm(montar, "install", "-g", "--prefix", montar, "--ignore-scripts", "--no-audit", "--no-fund",
+        "--loglevel=error", f"@openai/codex@{v}")
+    pasta = os.path.join(OPT, "lib", "node_modules", "@openai")
+    alvo = os.path.join(pasta, "codex")
+    os.makedirs(pasta, exist_ok=True)
+    novo = alvo + ".novo"
+    shutil.rmtree(novo, ignore_errors=True)
+    shutil.copytree(os.path.join(montar, "lib", "node_modules", "@openai", "codex"), novo, symlinks=True)
+    dono_root(novo)
+    if versao_cli(os.path.join(novo, "bin", "codex.js")) != v:
+        shutil.rmtree(novo, ignore_errors=True)
+        raise Recusa(f"O Codex {v} montado não rodou. Nada mudou no que está no ar.")
+    if os.path.isdir(alvo):
+        shutil.rmtree(alvo + ".anterior", ignore_errors=True)
+        os.rename(alvo, alvo + ".anterior")
+    os.rename(novo, alvo)
+    atalho = os.path.join(OPT, "bin", "codex")
+    if not os.path.lexists(atalho):
+        os.symlink("../lib/node_modules/@openai/codex/bin/codex.js", atalho)
+    shutil.rmtree(montar, ignore_errors=True)
+
+
+def instalar_clis(arquivo):
+    """Deixa o Claude Code e o Codex de OPT/bin nas versões de agentes/clis.json. São fixas e andam com a versão
+    da Ratoeira: sobem aqui, são testadas e chegam no aluno pela atualização. Devolve o que trocou."""
+    try:
+        with open(arquivo) as f:
+            pedidas = json.load(f)
+    except (OSError, ValueError):
+        log("aviso: sem agentes/clis.json nesta versão; Claude Code e Codex ficam como estão")
+        return []
+    trocados = []
+    for nome, instalar in (("claude", instalar_claude), ("codex", instalar_codex)):
+        v = str(pedidas.get(nome) or "")
+        if not v:
+            continue
+        if not VERSAO_CLI.match(v):
+            raise Recusa(f'agentes/clis.json: versão inválida pro {nome} ("{v}").')
+        atual = versao_cli(os.path.join(OPT, "bin", nome))
+        if atual == v:
+            continue
+        log(f"{nome}: {atual or '(não instalado)'} → {v}")
+        instalar(v)
+        trocados.append(f"{nome} {v}")
+    log("CLIs trocados: " + ", ".join(trocados) + "; vale na próxima conversa" if trocados
+        else "Claude Code e Codex já estão nas versões fixadas")
+    return trocados
+
+
+def apontar(alvo, destino):
+    """Troca o atalho alvo pra destino de uma vez (rename de um atalho novo por cima do antigo)."""
+    tmp = alvo + ".troca"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    os.symlink(os.path.relpath(destino, os.path.dirname(alvo)), tmp)
+    os.replace(tmp, alvo)
+
+
+def adotar(alvo):
+    """Instalação de antes das versões (alvo é pasta de verdade): vira uma versão e alvo vira atalho pra ela.
+    A .anterior de antes também vira versão, a mais velha. Devolve o caminho real no ar, ou None."""
+    if os.path.islink(alvo):
+        return os.path.realpath(alvo)
+    if not os.path.isdir(alvo):
+        return None
+    pasta_v = os.path.join(VERSOES, os.path.basename(alvo))
+    os.makedirs(pasta_v, mode=0o755, exist_ok=True)
+    if os.path.isdir(alvo + ".anterior") and not os.path.islink(alvo + ".anterior"):
+        os.rename(alvo + ".anterior", os.path.join(pasta_v, "00000000T000000Z-anterior"))
+    adotada = os.path.join(pasta_v, "00000000T000001Z-antes-das-versoes")
+    os.rename(alvo, adotada)
+    apontar(alvo, adotada)
+    log(f"{alvo} virou atalho; o que estava no ar ficou em {adotada}")
+    return adotada
+
+
+def limpar_versoes(alvo):
+    """Fica a versão no ar e as GUARDAR mais novas além dela; o resto sai."""
+    pasta_v = os.path.join(VERSOES, os.path.basename(alvo))
+    no_ar = os.path.realpath(alvo)
+    outras = sorted((os.path.join(pasta_v, n) for n in os.listdir(pasta_v)
+                     if not n.endswith(".montando") and os.path.isdir(os.path.join(pasta_v, n))
+                     and os.path.realpath(os.path.join(pasta_v, n)) != no_ar), reverse=True)
+    for velha in outras[GUARDAR:]:
+        shutil.rmtree(velha, ignore_errors=True)
+        log(f"versão velha apagada: {velha}")
+    for resto in (alvo + ".anterior", alvo + ".novo"):
+        if os.path.isdir(resto) and not os.path.islink(resto):
+            shutil.rmtree(resto, ignore_errors=True)
+
+
+def trocar_pasta(nova, alvo, versao):
+    """nova (montada, do usuário do gateway) vira /opt/ratoeira/versoes/<parte>/<carimbo>-<commit> e o atalho alvo
+    passa a apontar pra ela. Devolve (anterior, destino): o caminho real que estava no ar (ou None) e o novo."""
+    gravar(os.path.join(nova, ".versao"), versao + "\n")
+    pasta_v = os.path.join(VERSOES, os.path.basename(alvo))
+    os.makedirs(pasta_v, mode=0o755, exist_ok=True)
+    commit = re.sub(r"[^0-9a-f]", "", versao.split(" ")[0])[:12] or "sem-commit"
+    destino = os.path.join(pasta_v, datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + commit)
+    montando = destino + ".montando"
+    shutil.rmtree(montando, ignore_errors=True)
+    shutil.copytree(nova, montando, symlinks=True)
+    dono_root(montando)
+    os.rename(montando, destino)
+    anterior = adotar(alvo)
+    apontar(alvo, destino)
+    limpar_versoes(alvo)
+    return anterior, destino
+
+
+def instalar_skills(origem, backup):
+    """kit/skills (as skills do produto) → LIB/skills, trocando a pasta inteira. Quem liga em cada pessoa e no
+    Codex é o ratoeira-instrucoes. Devolve o que trocou."""
+    alvo = os.path.join(LIB, "skills")
+    if not os.path.isdir(origem):
+        return []
+    rel = lambda raiz: sorted((os.path.relpath(os.path.join(r, a), raiz), open(os.path.join(r, a), "rb").read())
+                              for r, _, arqs in os.walk(raiz) for a in arqs)
+    if os.path.isdir(alvo) and rel(alvo) == rel(origem):
+        return []
+    novo = alvo + ".novo"
+    shutil.rmtree(novo, ignore_errors=True)
+    shutil.copytree(origem, novo, symlinks=False)
+    dono_root(novo)
+    if os.path.isdir(alvo):
+        os.makedirs(backup, exist_ok=True)
+        os.rename(alvo, os.path.join(backup, "skills"))
+    os.rename(novo, alvo)
+    log(f"skills do produto trocadas: {', '.join(sorted(os.listdir(alvo)))}")
+    return [alvo]
+
+
+def instalar_arquivos(mapa, origem, backup):
+    """Copia cada arquivo do mapa (relativo a origem) pro destino; guarda o antigo em backup. Devolve os trocados."""
+    trocados = []
+    for rel, destino in mapa.items():
+        src = os.path.join(origem, rel)
+        if not os.path.isfile(src):
+            log(f"aviso: {rel} não está no git; pulei")
+            continue
+        with open(src, "rb") as f:
+            novo = f.read()
+        try:
+            with open(destino, "rb") as f:
+                if f.read() == novo:
+                    continue
+        except FileNotFoundError:
+            pass
+        if os.path.exists(destino):
+            os.makedirs(os.path.dirname(backup + destino), exist_ok=True)
+            shutil.copy2(destino, backup + destino)
+        modo = 0o755 if os.stat(src).st_mode & 0o111 else 0o644
+        os.makedirs(os.path.dirname(destino), exist_ok=True)
+        tmp = destino + ".ratoeira-tmp"
+        with open(tmp, "wb") as f:
+            f.write(novo)
+        os.chown(tmp, 0, 0)
+        os.chmod(tmp, modo)
+        os.replace(tmp, destino)
+        trocados.append(destino)
+        log(f"trocado: {destino}")
+    return trocados
+
+
+def saude_gateway(cfg, segundos=40):
+    url = f"http://127.0.0.1:{int(cfg.get('port', 6768))}/_ratoeira/health"
+    fim = time.time() + segundos
+    time.sleep(2)
+    while time.time() < fim:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+
+def instalar_pacotes(pedido):
+    pacotes = pedido.get("pacotes")
+    if not isinstance(pacotes, list) or not 1 <= len(pacotes) <= 20 or any(not isinstance(p, str) or not PACOTE.fullmatch(p) for p in pacotes):
+        raise Recusa("Lista de pacotes inválida (nomes de pacote Debian, de 1 a 20).")
+    log("apt-get install " + " ".join(pacotes))
+    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+    if rodar(["apt-get", "update", "-q"], timeout=300, env=env).returncode != 0:
+        raise Recusa("apt-get update falhou (log acima).")
+    if rodar(["apt-get", "install", "-y", "-q", *pacotes], timeout=900, env=env).returncode != 0:
+        raise Recusa("apt-get install falhou (log acima).")
+    return {"versao": "apt " + " ".join(pacotes)}
+
+
+def rodar_receita(fonte, pedido, por):
+    nome, args = pedido.get("receita"), pedido.get("args", [])
+    if not isinstance(nome, str) or not NOME_RECEITA.fullmatch(nome):
+        raise Recusa("Nome de receita inválido (minúsculas, números e hífen).")
+    if not isinstance(args, list) or len(args) > 3 or any(not isinstance(a, str) or not ARG_RECEITA.fullmatch(a) for a in args):
+        raise Recusa("Argumentos da receita inválidos (até 3, sem espaço).")
+    commit = conferir_git(fonte, "receita")
+    base = extrair(fonte, "receita", os.path.join(TRABALHO, "montar-receita"))
+    script = os.path.join(base, "kit", "receitas", nome)
+    if not os.path.isfile(script):
+        raise Recusa(f"Não achei kit/receitas/{nome} no último commit.")
+    # roda a cópia tirada do git (do commit), não o arquivo do repositório, que o time pode mudar no meio
+    copia = os.path.join(TRABALHO, f"receita-{nome}")
+    shutil.copy(script, copia)
+    os.chown(copia, 0, 0)
+    os.chmod(copia, 0o700)
+    shutil.rmtree(os.path.join(TRABALHO, "montar-receita"), ignore_errors=True)
+    log(f"receita {nome} {' '.join(args)} ({commit}), como root")
+    env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "LANG": "C.UTF-8",
+           "DEBIAN_FRONTEND": "noninteractive", "RATOEIRA_PEDIDO_POR": por}
+    try:
+        r = rodar([copia, *args], timeout=1500, env=env, cwd="/root")
+    finally:
+        os.remove(copia)
+    if r.returncode != 0:
+        raise Recusa(f"A receita {nome} saiu com código {r.returncode} (log acima).")
+    return {"versao": f"receita {nome} {' '.join(args)}".strip() + f" | {commit}"}
+
+
+def publicar(parte, por, pedido=None, fonte_produto=None):
+    cfg, fonte, liberadas = config_core(fonte_produto)
+    if parte not in liberadas:
+        raise Recusa(f'Esta Ratoeira não publica "{parte}" por aqui (config "core.partes": {", ".join(liberadas) or "nenhuma"}).')
+    if parte == "pacotes":
+        return instalar_pacotes(pedido or {})
+    if parte == "receita":
+        return rodar_receita(fonte, pedido or {}, por)
+    commit = conferir_git(fonte, parte)
+    versao = f"{commit} | {agora()} | {por}"
+    log(f"{parte}: {commit}")
+    os.makedirs(TRABALHO, mode=0o755, exist_ok=True)
+    base = extrair(fonte, parte, os.path.join(TRABALHO, "montar-" + parte))
+    carimbo = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = os.path.join(TRABALHO, "backups", f"{parte}-{carimbo}")
+
+    if parte == "telas":
+        origem = os.path.join(base, "gateway", "public")
+        alvo = f"{OPT}/gateway/public"
+        mapa = {}
+        for raiz, _, arquivos in os.walk(origem):
+            for a in arquivos:
+                rel = os.path.relpath(os.path.join(raiz, a), origem)
+                mapa[rel] = os.path.join(alvo, rel)
+        trocados = instalar_arquivos(mapa, origem, backup)
+        # a pasta segue legível pelo gateway; o que o build gera (markdown.js, editor.js...) fica
+        dono_root(alvo)
+        log(f"{len(trocados)} arquivo(s) de tela trocado(s); vale no próximo recarregar da página")
+
+    elif parte == "gateway":
+        pasta = os.path.join(base, "gateway")
+        shutil.rmtree(os.path.join(pasta, "test"), ignore_errors=True)
+        log("montando o gateway (npm ci + build:chat, como " + USUARIO_GW + ")")
+        npm(pasta, "ci", "--no-audit", "--no-fund")
+        npm(pasta, "run", "build:chat")
+        npm(pasta, "prune", "--omit=dev", "--no-audit", "--no-fund")
+        alvo = f"{OPT}/gateway"
+        anterior, destino = trocar_pasta(pasta, alvo, versao)
+        log("reiniciando o ratoeira-gateway (o chat de todo mundo cai uns segundos)")
+        subprocess.run(["systemctl", "restart", "ratoeira-gateway"])
+        if not saude_gateway(cfg):
+            log("o gateway não respondeu; últimas linhas do log:")
+            rodar(["journalctl", "-u", "ratoeira-gateway", "-n", "30", "--no-pager", "-o", "cat"])
+            if anterior and os.path.isdir(anterior):
+                apontar(alvo, anterior)
+                os.rename(destino, destino + "-falhou")
+                subprocess.run(["systemctl", "restart", "ratoeira-gateway"])
+                raise Recusa(f"O gateway novo não subiu. Voltei o anterior, que segue no ar (o que falhou ficou em {destino}-falhou).")
+            raise Recusa("O gateway novo não subiu e não havia versão anterior pra voltar.")
+        log("gateway no ar")
+
+    elif parte == "agentes":
+        pasta = os.path.join(base, "agentes")
+        shutil.rmtree(os.path.join(pasta, "test"), ignore_errors=True)
+        log("montando o servidor de agentes (npm ci, como " + USUARIO_GW + ")")
+        npm(pasta, "ci", "--omit=dev", "--omit=optional", "--no-audit", "--no-fund")
+        instalar_clis(os.path.join(pasta, "clis.json"))
+        trocar_pasta(pasta, f"{OPT}/agentes", versao)
+        log("servidor de agentes trocado; o de cada pessoa religa sozinho quando fica livre (sem conversa rodando nem terminal), em até 1 min")
+
+    elif parte == "regras":
+        trocados = instalar_arquivos(REGRAS, base, backup)
+        trocados += instalar_skills(os.path.join(base, "kit", "skills"), backup)
+        r = rodar([os.path.join(LIB, "ratoeira-instrucoes")], timeout=120)
+        if r.returncode != 0:
+            raise Recusa("O ratoeira-instrucoes falhou (log acima). Os arquivos antigos estão em " + backup)
+        log(f"{len(trocados)} arquivo(s) trocado(s); o texto dos agentes vale na próxima conversa")
+
+    elif parte == "kit":
+        origem = os.path.join(base, "kit", "multiusuario")
+        novos = sorted(set(os.listdir(origem)) - set(KIT) - FORA_DO_KIT - {"__pycache__"})
+        if novos:
+            log("aviso: arquivo novo em kit/multiusuario que este script não sabe onde instalar: " + ", ".join(novos)
+                + ". Quem administra instala pela sessão de root (e acrescenta no KIT do publicar-core).")
+        trocados = instalar_arquivos(KIT, origem, backup)
+        if any(t.startswith("/etc/systemd/") for t in trocados):
+            subprocess.run(["systemctl", "daemon-reload"], check=True)
+            log("systemd recarregado; cada serviço pega a unit nova na próxima vez que ligar")
+        log(f"{len(trocados)} arquivo(s) de root trocado(s)" + (f"; os antigos estão em {backup}" if trocados else ""))
+
+    # versão por parte, que o gateway mostra no estado (legível por todos)
+    vers_arq = os.path.join(TRABALHO, "versoes.json")
+    try:
+        with open(vers_arq) as f:
+            versoes = json.load(f)
+    except (OSError, ValueError):
+        versoes = {}
+    versoes[parte] = {"commit": commit, "em": agora(), "por": por}
+    gravar(vers_arq, json.dumps(versoes, ensure_ascii=False, indent=1) + "\n")
+    shutil.rmtree(os.path.join(TRABALHO, "montar-" + parte), ignore_errors=True)
+    return {"versao": versao}
+
+
+def main():
+    parte = sys.argv[1] if len(sys.argv) > 1 else ""
+    resultado = {"parte": parte, "em": agora()}
+    codigo = 0
+    if parte not in PARTES:
+        print(f"Parte desconhecida: {parte}", file=sys.stderr)
+        sys.exit(2)
+    os.makedirs(TRABALHO, mode=0o755, exist_ok=True)
+    # uma publicação de cada vez (telas e gateway mexem na mesma pasta)
+    trava = open(os.path.join(TRABALHO, ".trava"), "w")
+    fcntl.flock(trava, fcntl.LOCK_EX)
+    try:
+        with open(f"{PEDIDOS}/{parte}.json") as f:
+            pedido = json.load(f)
+        if pedido.get("parte") != parte:
+            raise Recusa("O pedido não bate com o nome da unit.")
+        resultado.update(ok=True, **publicar(parte, str(pedido.get("por", ""))[:200], pedido))
+    except Recusa as e:
+        log("RECUSADO: " + str(e))
+        resultado.update(ok=False, erro=str(e))
+        codigo = 1
+    except FileNotFoundError:
+        log("RECUSADO: não achei o pedido do gateway")
+        resultado.update(ok=False, erro="Não achei o pedido do gateway.")
+        codigo = 1
+    except Exception as e:  # erro inesperado: vai pro log e pro agente, sem esconder
+        log(f"ERRO: {type(e).__name__}: {e}")
+        resultado.update(ok=False, erro=f"Erro inesperado ({type(e).__name__}: {e}). Na VPS: journalctl -u ratoeira-publicar-core@{parte}")
+        codigo = 1
+    resultado["log"] = log_linhas[-80:]
+    if os.path.isdir(PEDIDOS):
+        gravar(f"{PEDIDOS}/{parte}.resultado.json", json.dumps(resultado, ensure_ascii=False, indent=1) + "\n", 0o644)
+        try:
+            os.remove(f"{PEDIDOS}/{parte}.json")
+        except OSError:
+            pass
+    sys.exit(codigo)
+
+
+if __name__ == "__main__":
+    main()

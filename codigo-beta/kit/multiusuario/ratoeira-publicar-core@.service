@@ -1,0 +1,16 @@
+# Publica uma parte da própria Ratoeira: ratoeira-publicar-core@<parte>.service
+# (telas, gateway, agentes, regras ou kit). O gateway grava o pedido (<pedidos>/<parte>.json) de um admin
+# e dá "start" nesta unit (regra do polkit, sem esperar: a parte "gateway" reinicia o próprio gateway).
+# Roda o publicar-core como root e termina; o resultado vai pra <pedidos>/<parte>.resultado.json.
+# Plano: docs/2026-10-09-publicar-core.md
+[Unit]
+Description=Ratoeira - publicar a parte %i da própria Ratoeira
+
+[Service]
+Type=oneshot
+Environment=RATOEIRA_PEDIDOS_CORE=/var/lib/ratoeira/gateway-estado/publicar-core
+Environment=RATOEIRA_CONFIG=/etc/ratoeira/gateway.config.json
+Environment=RATOEIRA_USUARIO_GATEWAY=ratoeira-gateway
+ExecStart=/usr/local/sbin/ratoeira-publicar-core %i
+# npm ci do gateway (esbuild, CodeMirror) leva uns minutos na primeira vez
+TimeoutStartSec=1200

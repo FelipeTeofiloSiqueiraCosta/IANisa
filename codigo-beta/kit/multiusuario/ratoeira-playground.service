@@ -1,0 +1,15 @@
+# Playground (playground, como root): estado dos containers com a etiqueta ratoeira.play pra tela de Apps,
+# e desliga o experimento que ficou RATOEIRA_PLAYGROUND_DIAS sem acesso. Instalado pela receita kit/receitas/playground.
+[Unit]
+Description=Ratoeira - Playground (estado dos experimentos em Docker)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+Environment=RATOEIRA_GRUPO=ratoeira-gw
+Environment=RATOEIRA_PLAYGROUND_ESTADO=/var/lib/ratoeira/playground/estado.json
+Environment=RATOEIRA_PLAYGROUND_ACESSOS=/var/lib/ratoeira/gateway-estado/playground-acessos.json
+Environment=RATOEIRA_PLAYGROUND_DIAS=7
+ExecStart=/usr/local/sbin/ratoeira-playground
+TimeoutStartSec=120

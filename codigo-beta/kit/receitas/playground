@@ -1,0 +1,28 @@
+#!/bin/bash
+# Playground da Ratoeira (13/10/2026): experimentos em Docker com a etiqueta ratoeira.play, abertos por subdomínio
+# pelo gateway (playground.mjs). Esta receita instala o ajudante de root que mostra o estado dos containers na tela
+# de Apps e desliga o que ficou 7 dias sem acesso (kit/multiusuario/playground + ratoeira-playground.{service,timer}).
+# Roda pelo chat de um admin (rodar_receita, nome "playground") ou à mão: sudo ./playground. Idempotente; confere no fim.
+# O endereço de cada experimento (DNS e túnel ou Caddy) é da instalação, não daqui.
+set -euo pipefail
+[ "$(id -u)" = 0 ] || { echo "Rode com sudo."; exit 1; }
+# a receita roda sozinha (o publicar-core copia só ela): os outros arquivos saem do último commit da fonte do núcleo
+FONTE=${RATOEIRA_FONTE:-$(python3 -c 'import json;print(json.load(open("/etc/ratoeira/gateway.config.json"))["core"]["fonte"])')}
+[ -d "$FONTE/kit/multiusuario" ] || { echo "PAREI: não achei a fonte do núcleo ($FONTE)."; exit 1; }
+KIT=$(mktemp -d); trap 'rm -rf "$KIT"' EXIT
+for f in playground ratoeira-playground.service ratoeira-playground.timer; do
+  git -c safe.directory='*' -C "$FONTE" show "HEAD:./kit/multiusuario/$f" > "$KIT/$f"
+done
+command -v docker >/dev/null || { echo "PAREI: Docker não está instalado (sudo apt-get install docker.io docker-compose-v2)."; exit 1; }
+docker compose version >/dev/null 2>&1 || { echo "aviso: falta o docker compose (pacote docker-compose-v2); o playground funciona, mas o agente vai precisar dele."; }
+getent group ratoeira-gw >/dev/null || { echo "PAREI: grupo ratoeira-gw (do gateway) não existe."; exit 1; }
+install -m 755 -o root -g root "$KIT/playground" /usr/local/sbin/ratoeira-playground
+install -m 644 -o root -g root "$KIT/ratoeira-playground.service" "$KIT/ratoeira-playground.timer" /etc/systemd/system/
+install -d -m 750 -o root -g ratoeira-gw /var/lib/ratoeira/playground
+systemctl daemon-reload
+systemctl enable --now ratoeira-playground.timer
+systemctl start ratoeira-playground.service
+# confere
+[ -f /var/lib/ratoeira/playground/estado.json ] || { echo "FALHOU: o estado não foi gravado (journalctl -u ratoeira-playground)."; exit 1; }
+systemctl is-active --quiet ratoeira-playground.timer || { echo "FALHOU: o timer não ligou."; exit 1; }
+python3 -c 'import json;d=json.load(open("/var/lib/ratoeira/playground/estado.json"));print("Playground ok:",len(d["containers"]),"container(s) com etiqueta ratoeira.play")'

@@ -1,0 +1,41 @@
+#!/bin/bash
+# Religa o servidor de agentes (ratoeira-agentes@<usuário>) de quem ainda roda código de antes da última
+# publicação, sem derrubar conversa nem terminal. Receita: roda como root pelo chat de um admin
+# (rodar_receita, nome "religar-agentes") ou à mão: sudo ./religar-agentes
+# - livre (sem conversa rodando, login nem terminal): para agora; o chat reconecta e o gateway liga a versão nova
+# - ocupado: deixa um vigia (unit transitória ratoeira-religar-<usuário>) que confere a cada 15 s e para quando
+#   ficar livre, por até 6 h
+# Desde 10/10/2026 o servidor faz isso sozinho quando o .versao muda; esta receita é pra quem ligou antes disso
+# (código que não sabe se religar) ou pra forçar.
+set -euo pipefail
+[ "$(id -u)" = 0 ] || { echo "Rode com sudo."; exit 1; }
+VERSAO=/opt/ratoeira/agentes/.versao
+[ -f "$VERSAO" ] || { echo "Sem $VERSAO: nada publicado pelo publicar-core ainda."; exit 1; }
+publicado=$(stat -c %Y "$VERSAO")
+estado(){ curl -s -m 5 --unix-socket "/run/ratoeira-agentes-$1/agentes.sock" http://x/estado || true; }
+livre(){ local e; e=$(estado "$1"); [ -n "$e" ] && echo "$e" | grep -q '"ocupado":false' && echo "$e" | grep -q '"terminais":0'; }
+unidades=$(systemctl list-units 'ratoeira-agentes@*' --state=active --no-legend --plain | awk '{print $1}')
+[ -n "$unidades" ] || { echo "Nenhum servidor de agentes ligado. Pronto."; exit 0; }
+for un in $unidades; do
+  u=${un#ratoeira-agentes@}; u=${u%.service}
+  [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "$u: nome estranho, pulei"; continue; }
+  desde=$(systemctl show -p ActiveEnterTimestamp --value "$un")
+  ligou=$(date -d "$desde" +%s 2>/dev/null || echo 0)
+  if [ "$ligou" -ge "$publicado" ]; then echo "$u: já está na versão publicada (ligou $desde)"; continue; fi
+  if livre "$u"; then
+    systemctl stop --no-block "$un"; echo "$u: estava livre, religando agora"
+  else
+    vigia="ratoeira-religar-$u"
+    systemctl stop "$vigia" 2>/dev/null || true
+    systemd-run --quiet --collect --unit="$vigia" /bin/bash -c '
+      u="$1"; un="ratoeira-agentes@$u.service"; s="/run/ratoeira-agentes-$u/agentes.sock"
+      for i in $(seq 1 1440); do
+        systemctl is-active --quiet "$un" || exit 0
+        e=$(curl -s -m 5 --unix-socket "$s" http://x/estado || true)
+        if echo "$e" | grep -q "\"ocupado\":false" && echo "$e" | grep -q "\"terminais\":0"; then systemctl stop "$un"; echo "$u: livre, religado"; exit 0; fi
+        sleep 15
+      done; echo "$u: 6 h ocupado, desisti"' _ "$u"
+    echo "$u: ocupado agora ($(estado "$u")); religa sozinho assim que ficar livre (vigia $vigia)"
+  fi
+done
+echo "Pronto."

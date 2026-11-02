@@ -1,0 +1,18 @@
+{
+  "name": "ratoeira-agentes",
+  "version": "0.11.1",
+  "private": true,
+  "description": "Servidor de agentes da Ratoeira (um por pessoa): fala ACP com os adaptadores do Claude, do Codex e de outros agentes",
+  "type": "module",
+  "license": "UNLICENSED",
+  "scripts": {
+    "test": "node --test --test-timeout=30000 test/*.test.mjs",
+    "start": "node servidor.mjs"
+  },
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.99.0",
+    "@agentclientprotocol/codex-acp": "2.3.0",
+    "@agentclientprotocol/sdk": "1.7.0",
+    "ws": "8.18.3"
+  }
+}

@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Roda um comando ffmpeg no Rendi (rendi.dev, "ffmpeg por API"), fora da VPS, e traz o resultado pra pasta.
+
+  python3 rendi rodar --entrada in_1=bruto.mp4 --saida out_1=final.mp4 \\
+      --comando '-i {{in_1}} -c:v libx264 -preset medium -crf 22 -c:a aac {{out_1}}' [--pasta saida/] [--max 600]
+  python3 rendi enviar arquivo.mp4      sobe um arquivo e imprime file_id e storage_url
+  python3 rendi estado <command_id>     mostra o estado de um comando
+
+Entrada pode ser arquivo local (sobe sozinho) ou URL pública. Ao terminar, baixa as saídas e apaga no Rendi as
+saídas e o que subiu (lá o link é público por padrão); --manter deixa tudo lá. Chave: RENDI_API_KEY (ver o
+script chave ao lado). Doc da API: https://www.rendi.dev/docs/llms.txt
+"""
+import argparse, json, os, subprocess, sys, time, urllib.error, urllib.request
+
+API = "https://api.rendi.dev/v1"
+AQUI = os.path.dirname(os.path.abspath(__file__))
+
+
+def chave():
+    r = subprocess.run(["bash", os.path.join(AQUI, "chave"), "RENDI_API_KEY"], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("sem RENDI_API_KEY: liga o Rendi (seção \"Ligar o Rendi\" da skill) ou roda aqui com ffmpeg-leve")
+    return r.stdout.strip()
+
+
+def pedir(metodo, caminho, corpo=None, k=None):
+    dados = json.dumps(corpo).encode() if corpo is not None else None
+    req = urllib.request.Request(API + caminho, data=dados, method=metodo)
+    req.add_header("X-API-KEY", k)
+    if dados is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            txt = r.read().decode()
+            return json.loads(txt) if txt else {}
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode(errors="replace")[:500]
+        dica = {401: "chave inválida", 403: "cota do mês estourada ou o plano não permite isso",
+                429: "pedidos demais por minuto (no grátis são 4): espera um pouco"}.get(e.code, "")
+        sys.exit(f"Rendi respondeu {e.code} em {metodo} {caminho}{' (' + dica + ')' if dica else ''}: {msg}")
+
+
+def enviar(caminho, k):
+    nome = "".join(c if c.isalnum() or c in "._-" else "_" for c in os.path.basename(caminho))
+    tam = os.path.getsize(caminho)
+    ini = pedir("POST", "/files/init-upload", {"filename": nome, "size_bytes": tam}, k)
+    fid, parte, urls = ini["file_id"], ini["part_size"], ini["upload_urls"]
+    partes = []
+    with open(caminho, "rb") as f:
+        for i, url in enumerate(urls, 1):
+            pedaco = f.read(parte)
+            req = urllib.request.Request(url, data=pedaco, method="PUT")
+            for tentativa in range(3):
+                try:
+                    with urllib.request.urlopen(req, timeout=600) as r:
+                        partes.append({"part_number": i, "etag": r.headers["ETag"]})
+                    break
+                except (urllib.error.URLError, TimeoutError) as e:
+                    if tentativa == 2:
+                        pedir("POST", f"/files/{fid}/abort-upload", {}, k)
+                        sys.exit(f"envio da parte {i} falhou: {e}")
+                    time.sleep(5)
+            print(f"enviando {nome}: parte {i}/{len(urls)}", file=sys.stderr)
+    pedir("POST", f"/files/{fid}/complete-upload", {"parts": partes}, k)
+    while True:
+        a = pedir("GET", f"/files/{fid}", None, k)
+        if a.get("status") == "STORED":
+            return a
+        if a.get("status") == "FAILED":
+            sys.exit(f"o Rendi não guardou {nome}")
+        time.sleep(3)
+
+
+def baixar(url, destino):
+    with urllib.request.urlopen(url, timeout=600) as r, open(destino, "wb") as f:
+        while bloco := r.read(1 << 20):
+            f.write(bloco)
+
+
+def rodar(a, k):
+    entradas, subidos = {}, []
+    for e in a.entrada:
+        nome, _, valor = e.partition("=")
+        if valor.startswith(("http://", "https://")):
+            entradas[nome] = valor
+        elif os.path.isfile(valor):
+            arq = enviar(valor, k)
+            subidos.append(arq["file_id"])
+            entradas[nome] = arq["storage_url"]
+        else:
+            sys.exit(f"entrada {nome}: nem URL nem arquivo ({valor})")
+    saidas = dict(s.partition("=")[::2] for s in a.saida)
+    corpo = {"input_files": entradas, "output_files": saidas, "ffmpeg_command": a.comando,
+             "max_command_run_seconds": a.max}
+    if a.vcpu:
+        corpo["vcpu_count"] = a.vcpu
+    cid = pedir("POST", "/run-ffmpeg-command", corpo, k)["command_id"]
+    print(f"comando {cid} na fila", file=sys.stderr)
+    ultimo = None
+    while True:
+        st = pedir("GET", f"/commands/{cid}", None, k)
+        etapa = st.get("status"), st.get("processing_stage")
+        if etapa != ultimo:
+            print("rendi:", " / ".join(x for x in etapa if x), file=sys.stderr)
+            ultimo = etapa
+        if st.get("status") in ("SUCCESS", "FAILED"):
+            break
+        time.sleep(5)
+    if st["status"] == "FAILED":
+        sys.exit(f"o comando falhou no Rendi: {st.get('error_status')} {st.get('error_message')}")
+    os.makedirs(a.pasta, exist_ok=True)
+    baixados = []
+    for chave_saida, info in (st.get("output_files") or {}).items():
+        destino = os.path.join(a.pasta, saidas.get(chave_saida) or info.get("file_id"))
+        baixar(info["storage_url"], destino)
+        baixados.append(destino)
+    if not a.manter:
+        pedir("DELETE", f"/commands/{cid}/files", None, k)
+        for fid in subidos:
+            pedir("DELETE", f"/files/{fid}", None, k)
+    print(json.dumps({"command_id": cid, "arquivos": baixados,
+                      "segundos_ffmpeg": st.get("ffmpeg_command_run_seconds"),
+                      "segundos_total": st.get("total_processing_seconds"),
+                      "cota_usada_mb": st.get("processing_quota_used"),
+                      "apagado_no_rendi": not a.manter}, ensure_ascii=False, indent=2))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="acao", required=True)
+    r = sub.add_parser("rodar")
+    r.add_argument("--comando", required=True, help="comando sem a palavra ffmpeg, com {{in_1}} e {{out_1}}")
+    r.add_argument("--entrada", action="append", required=True, help="in_1=arquivo.mp4 ou in_1=https://…")
+    r.add_argument("--saida", action="append", required=True, help="out_1=nome.mp4 (só letras, números, _ e .)")
+    r.add_argument("--pasta", default=".")
+    r.add_argument("--max", type=int, default=60, help="segundos máximos do ffmpeg (grátis: 60; Pro: 600 ou mais)")
+    r.add_argument("--vcpu", type=int)
+    r.add_argument("--manter", action="store_true", help="não apaga no Rendi depois de baixar")
+    e = sub.add_parser("enviar")
+    e.add_argument("arquivo")
+    s = sub.add_parser("estado")
+    s.add_argument("command_id")
+    a = p.parse_args()
+    k = chave()
+    if a.acao == "rodar":
+        rodar(a, k)
+    elif a.acao == "enviar":
+        arq = enviar(a.arquivo, k)
+        print(json.dumps({"file_id": arq["file_id"], "storage_url": arq["storage_url"]}, indent=2))
+    else:
+        print(json.dumps(pedir("GET", f"/commands/{a.command_id}", None, k), ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

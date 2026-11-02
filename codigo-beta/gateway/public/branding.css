@@ -1,0 +1,20 @@
+/* Ratoeira presentation overlay for Paseo 0.7.2; upstream files stay intact.
+ * The path prefix identifies PaseoLogo only, preserving agent and toolbar icons.
+ */
+svg:has(> path[d^="M291.495 91.399C333.897"]) {
+  background: url('/_ratoeira/icon.png') center / contain no-repeat;
+}
+
+svg > path[d^="M291.495 91.399C333.897"] {
+  visibility: hidden;
+}
+
+/* The web startup logo is a CSS mask, separate from the inline SVG component.
+ * Its container is decorative; startup errors render outside this test ID.
+ */
+[data-testid="startup-splash"] > div:last-child {
+  -webkit-mask-image: none !important;
+  mask-image: none !important;
+  background: transparent url('/_ratoeira/icon.png') center / contain no-repeat !important;
+  animation: none !important;
+}

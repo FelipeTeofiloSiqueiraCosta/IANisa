@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""Automações e integrações da Ratoeira, como root, pela unit ratoeira-automacoes.service
+(timer de 1 em 1 minuto, e o gateway liga na hora pela regra do polkit).
+
+1. Instala as automações e as rotinas de cada pessoa. Automação (comando) mora em ~/.config/ratoeira/crontab;
+   rotina (pedido pro agente num horário) em ~/.config/ratoeira/rotinas/<id>.md e vira uma linha que chama o
+   ratoeira-rotina. As duas coisas viram um crontab só. O arquivo das automações, ela
+   ela e o agente dela editam (o comando `crontab` não grava de dentro do servidor de agentes, por causa
+   do NoNewPrivileges). Daqui ele vira o crontab de verdade dela (`crontab -u <pessoa>`): roda como ela,
+   nunca como outra pessoa. Erro de sintaxe mantém o crontab anterior e vira aviso na tela.
+2. Liga ou desliga uma linha a pedido do admin (RATOEIRA_AUTOMACOES_PEDIDO, gravado pelo gateway). A
+   edição roda como a dona do arquivo (runuser), nunca como root dentro da home dela.
+3. Monta o inventário que só o admin vê na tela (inventario.json, grupo do gateway): as automações de
+   cada pessoa com o último resultado, os crons e timers da VPS, e os MCPs de cada pessoa (só nome, tipo e
+   host: URL e argumentos podem levar chave).
+
+Pessoa = usuário do grupo ratoeira-pessoas, UID >= 1000, sem sudo (mesma régua do aplicar-acessos).
+"""
+import fcntl, grp, hashlib, json, os, pwd, re, stat, subprocess, sys, time
+from urllib.parse import urlsplit
+
+PESSOAS = "ratoeira-pessoas"
+ESTADO = "/var/lib/ratoeira-automacoes"
+GRUPO = os.environ.get("RATOEIRA_GRUPO", "ratoeira-gw")
+PEDIDO = os.environ.get("RATOEIRA_AUTOMACOES_PEDIDO", "")
+ARQ = ".config/ratoeira/crontab"
+ROTINAS = ".config/ratoeira/rotinas"
+ID_ROTINA = re.compile(r"^[a-z0-9][a-z0-9-]{0,59}$")
+QUANDO_OK = re.compile(r"^(@(reboot|yearly|annually|monthly|weekly|daily|midnight|hourly)|([0-9A-Za-z*,/-]+\s+){4}[0-9A-Za-z*,/-]+)$")
+SIM = {"sim", "true", "yes", "1", "ligada", "on"}
+CRONS = ".local/state/ratoeira/crons"
+DESLIGADO = "#desligado# "
+CABECALHO = "# Instalado pela Ratoeira a partir de ~/.config/ratoeira/crontab. Edite lá, não aqui.\n"
+MAX = 64 * 1024
+ADMINS = {"sudo", "wheel", "admin", "root"}
+
+
+def pessoas():
+    try: membros = grp.getgrnam(PESSOAS).gr_mem
+    except KeyError: return []
+    out = []
+    for nome in membros:
+        try: pw = pwd.getpwnam(nome)
+        except KeyError: continue
+        grupos = {g.gr_name for g in grp.getgrall() if nome in g.gr_mem}
+        if pw.pw_uid >= 1000 and not grupos & ADMINS: out.append(pw)
+    return out
+
+
+def ler_da_pessoa(pw, rel, limite):
+    """Lê um arquivo da home da pessoa sem seguir atalho no fim e só se for dela (um atalho no meio do
+    caminho não leva a arquivo de outro dono: o dono é conferido no arquivo aberto)."""
+    try:
+        fd = os.open(os.path.join(pw.pw_dir, rel), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError: return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != pw.pw_uid or st.st_size > limite: return None
+        return os.read(fd, limite + 1).decode("utf-8", "replace")
+    finally: os.close(fd)
+
+
+def listar_da_pessoa(pw, rel):
+    d = os.path.join(pw.pw_dir, rel)
+    try:
+        st = os.lstat(d)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != pw.pw_uid: return []
+        return sorted(os.listdir(d))[:200]
+    except OSError: return []
+
+
+def gravar(caminho, dados, modo, gid=None):
+    os.makedirs(os.path.dirname(caminho), exist_ok=True)
+    tmp = caminho + ".tmp"
+    with open(tmp, "w") as f: f.write(dados)
+    os.chmod(tmp, modo)
+    if gid is not None: os.chown(tmp, 0, gid)
+    os.replace(tmp, caminho)
+
+
+def cabecalho_rotina(texto):
+    m = re.match(r"^---\r?\n(.*?)\r?\n---\r?\n?(.*)$", texto or "", re.S)
+    if not m: return None, ""
+    cab = {}
+    for linha in m.group(1).splitlines():
+        k = re.match(r"^([A-Za-z_]+):\s*(.*)$", linha)
+        if k: cab[k.group(1).lower()] = k.group(2).strip().strip("\"'")
+    return cab, m.group(2).strip()
+
+
+def rotinas_de(pw):
+    """As rotinas da pessoa: [(id, cabeçalho, pedido, texto)], só as com nome de arquivo e horário válidos."""
+    out = []
+    for nome in listar_da_pessoa(pw, ROTINAS):
+        if not nome.endswith(".md") or not ID_ROTINA.match(nome[:-3]): continue
+        texto = ler_da_pessoa(pw, os.path.join(ROTINAS, nome), MAX)
+        cab, pedido = cabecalho_rotina(texto)
+        if cab is not None: out.append((nome[:-3], cab, pedido, texto))
+    return out
+
+
+def crontab_completo(pw):
+    """O que vai pro crontab dela: as rotinas (geradas) e o arquivo das automações (como ela escreveu)."""
+    texto = ler_da_pessoa(pw, ARQ, MAX)
+    linhas = []
+    for id_, cab, _, _ in rotinas_de(pw):
+        quando = cab.get("quando", "")
+        if not QUANDO_OK.match(quando): continue
+        ligada = cab.get("ligada", "sim").lower() in SIM
+        linhas.append(("" if ligada else "# desligada: ") + "%s /usr/local/bin/ratoeira-cron rotina-%s -- /usr/local/bin/ratoeira-rotina %s" % (quando, id_, id_))
+    if texto is None and not linhas: return None
+    partes = []
+    if linhas: partes.append("# Rotinas (~/.config/ratoeira/rotinas)\n" + "\n".join(linhas) + "\n")
+    if texto: partes.append(texto + ("" if texto.endswith("\n") else "\n"))
+    return "\n".join(partes)
+
+
+def alternar_rotina(id_, ligar):
+    """Roda como a dona (runuser): troca o 'ligada:' do cabeçalho da rotina."""
+    if not ID_ROTINA.match(id_): sys.exit("rotina inválida")
+    caminho = os.path.join(os.path.expanduser("~"), ROTINAS, id_ + ".md")
+    texto = open(caminho, encoding="utf-8").read()
+    m = re.match(r"^(---\r?\n)(.*?)(\r?\n---)", texto, re.S)
+    if not m: sys.exit("rotina sem cabeçalho")
+    cab = m.group(2)
+    valor = "sim" if ligar else "não"
+    cab = re.sub(r"(?m)^ligada:.*$", "ligada: " + valor, cab) if re.search(r"(?m)^ligada:", cab) else cab + "\nligada: " + valor
+    tmp = caminho + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: f.write(m.group(1) + cab + m.group(3) + texto[m.end():])
+    os.replace(tmp, caminho)
+
+
+def instalar(lista):
+    caminho = os.path.join(ESTADO, "instalado.json")
+    try: feito = json.load(open(caminho))
+    except (OSError, ValueError): feito = {}
+    for pw in lista:
+        texto = crontab_completo(pw)
+        status = {}
+        if texto is None:
+            # apagou o arquivo: tira o crontab que a Ratoeira instalou (um crontab feito à mão fica)
+            if pw.pw_name in feito:
+                subprocess.run(["crontab", "-u", pw.pw_name, "-r"], capture_output=True)
+                del feito[pw.pw_name]
+        else:
+            h = hashlib.sha256(texto.encode()).hexdigest()
+            if feito.get(pw.pw_name, {}).get("hash") != h:
+                corpo = CABECALHO + texto + ("" if texto.endswith("\n") else "\n")
+                r = subprocess.run(["crontab", "-u", pw.pw_name, "-"], input=corpo, capture_output=True, text=True)
+                if r.returncode == 0: feito[pw.pw_name] = {"hash": h, "em": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                else: status["erro"] = (r.stderr or r.stdout).strip()[:1000] or "O cron recusou o arquivo."
+            if pw.pw_name in feito: status["instaladoEm"] = feito[pw.pw_name]["em"]
+        # com erro, tenta de novo a cada minuto (o crontab anterior segue valendo); o aviso some quando instala
+        anterior = os.path.join(ESTADO, "status", pw.pw_name + ".json")
+        gravar(anterior, json.dumps(status), 0o640, pw.pw_gid)
+    gravar(caminho, json.dumps(feito), 0o600)
+
+
+def alternar_meu(linha, ligar, esperado):
+    """Roda como a dona do arquivo (runuser): liga ou desliga a linha, conferindo que é a mesma que a tela viu."""
+    caminho = os.path.join(os.path.expanduser("~"), ARQ)
+    with open(caminho) as f: linhas = f.read().split("\n")
+    if not 0 <= linha < len(linhas): sys.exit("linha fora do arquivo")
+    base = linhas[linha][len(DESLIGADO):] if linhas[linha].startswith(DESLIGADO) else linhas[linha]
+    if base != esperado: sys.exit("o arquivo mudou; recarregue a tela")
+    linhas[linha] = base if ligar else DESLIGADO + base
+    tmp = caminho + ".tmp"
+    with open(tmp, "w") as f: f.write("\n".join(linhas))
+    os.replace(tmp, caminho)
+
+
+def pedido(lista):
+    if not PEDIDO or not os.path.exists(PEDIDO): return
+    try: p = json.load(open(PEDIDO))
+    except (OSError, ValueError): p = None
+    os.remove(PEDIDO)
+    if not isinstance(p, dict): return
+    pw = next((x for x in lista if x.pw_name == p.get("usuario")), None)
+    gid = grp.getgrnam(GRUPO).gr_gid
+    if p.get("rotina") is not None:
+        if not pw or not isinstance(p.get("rotina"), str) or not ID_ROTINA.match(p["rotina"]) or not isinstance(p.get("ligar"), bool): return
+        r = subprocess.run(["runuser", "-u", pw.pw_name, "--", sys.executable, os.path.abspath(__file__), "--alternar-rotina", p["rotina"], "1" if p["ligar"] else "0"], capture_output=True, text=True)
+        gravar(os.path.join(ESTADO, "pedido-resultado.json"), json.dumps({"ok": r.returncode == 0, "erro": r.stderr.strip()[:500]}), 0o640, gid)
+        return
+    linha, texto, ligar = p.get("linha"), p.get("texto"), p.get("ligar")
+    if not pw or not isinstance(linha, int) or not isinstance(texto, str) or not isinstance(ligar, bool) or len(texto) > 4000: return
+    r = subprocess.run(["runuser", "-u", pw.pw_name, "--", sys.executable, os.path.abspath(__file__), "--alternar-meu", str(linha), "1" if ligar else "0"],
+                       input=texto, capture_output=True, text=True)
+    gravar(os.path.join(ESTADO, "pedido-resultado.json"), json.dumps({"ok": r.returncode == 0, "erro": r.stderr.strip()[:500]}), 0o640, grp.getgrnam(GRUPO).gr_gid)
+
+
+def mcps(pw):
+    """Nomes, tipo e host dos MCPs da pessoa (Claude e Codex). Sem URL inteira, sem argumentos, sem env."""
+    out = []
+    def um(nome, d, escopo, agente):
+        if not isinstance(d, dict): return
+        alvo = ""
+        if d.get("url"):
+            try: alvo = urlsplit(str(d["url"])).hostname or ""
+            except ValueError: alvo = ""
+        elif d.get("command"): alvo = os.path.basename(str(d["command"]))
+        out.append({"nome": str(nome)[:80], "tipo": str(d.get("type") or ("http" if d.get("url") else "stdio"))[:20], "alvo": alvo[:120], "escopo": escopo, "agente": agente})
+    texto = ler_da_pessoa(pw, ".claude.json", 20 * 1024 * 1024)
+    if texto:
+        try:
+            j = json.loads(texto)
+            for n, d in (j.get("mcpServers") or {}).items(): um(n, d, "usuário", "claude")
+            for proj, v in (j.get("projects") or {}).items():
+                for n, d in ((v or {}).get("mcpServers") or {}).items(): um(n, d, "projeto " + str(proj)[:200], "claude")
+        except ValueError: pass
+    toml = ler_da_pessoa(pw, ".codex/config.toml", 1024 * 1024) or ""
+    for n in re.findall(r"^\[mcp_servers\.\"?([^\]\"]+)\"?\]", toml, re.M): out.append({"nome": n[:80], "tipo": "", "alvo": "", "escopo": "usuário", "agente": "codex"})
+    return out
+
+
+def estados(pw):
+    out = {}
+    for nome in listar_da_pessoa(pw, CRONS):
+        if nome.endswith(".json"):
+            t = ler_da_pessoa(pw, os.path.join(CRONS, nome), 4096)
+            try: out[nome[:-5]] = json.loads(t) if t else None
+            except ValueError: pass
+        elif nome.endswith(".log"):
+            t = ler_da_pessoa(pw, os.path.join(CRONS, nome), 1024 * 1024)
+            if t: out.setdefault("_logs", {})[nome[:-4]] = t[-6000:]
+    return out
+
+
+def crontab_de(nome):
+    r = subprocess.run(["crontab", "-u", nome, "-l"], capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def inventario(lista):
+    nomes = {p.pw_name for p in lista}
+    gente = []
+    for pw in lista:
+        texto = ler_da_pessoa(pw, ARQ, MAX)
+        try: st = json.load(open(os.path.join(ESTADO, "status", pw.pw_name + ".json")))
+        except (OSError, ValueError): st = {}
+        e = estados(pw)
+        rots = [{"id": i, "nome": c.get("nome") or i, "quando": c.get("quando", ""), "agente": c.get("agente", "claude"), "pasta": c.get("pasta", ""),
+                 "ligada": c.get("ligada", "sim").lower() in SIM, "pedido": pedido[:2000]} for i, c, pedido, _ in rotinas_de(pw)]
+        gente.append({"usuario": pw.pw_name, "nome": (pw.pw_gecos or "").split(",")[0] or pw.pw_name, "rotinas": rots,
+                      "gerenciado": texto is not None or bool(rots),
+                      # o crontab instalado só aparece quando a Ratoeira não cuida dele (feito à mão); senão, as rotinas sairiam duplicadas
+                      "crontab": texto if texto is not None else ("" if rots else crontab_de(pw.pw_name)),
+                      "estados": {k: v for k, v in e.items() if k != "_logs"}, "logs": e.get("_logs", {}), "status": st, "mcps": mcps(pw)})
+    sistema = []
+    for nome in sorted(os.listdir("/etc/cron.d")):
+        if nome.startswith(".") or "~" in nome: continue
+        try: sistema.append({"origem": "/etc/cron.d/" + nome, "texto": open("/etc/cron.d/" + nome).read()[:MAX], "comUsuario": True})
+        except OSError: pass
+    try:
+        for u in sorted(os.listdir("/var/spool/cron/crontabs")):
+            if u not in nomes: sistema.append({"origem": "crontab de " + u, "usuario": u, "texto": crontab_de(u)[:MAX], "comUsuario": False})
+    except OSError: pass
+    timers = []
+    r = subprocess.run(["systemctl", "list-timers", "--all", "--output=json"], capture_output=True, text=True)
+    try: timers = json.loads(r.stdout)
+    except ValueError: pass
+    gravar(os.path.join(ESTADO, "inventario.json"),
+           json.dumps({"geradoEm": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "pessoas": gente, "sistema": sistema, "timers": timers}),
+           0o640, grp.getgrnam(GRUPO).gr_gid)
+
+
+def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--alternar-rotina":
+        alternar_rotina(sys.argv[2], sys.argv[3] == "1"); return
+    if len(sys.argv) == 4 and sys.argv[1] == "--alternar-meu":
+        alternar_meu(int(sys.argv[2]), sys.argv[3] == "1", sys.stdin.read()); return
+    if os.geteuid() != 0: sys.exit("roda como root (ratoeira-automacoes.service)")
+    os.makedirs(os.path.join(ESTADO, "status"), exist_ok=True)
+    os.chmod(ESTADO, 0o755); os.chmod(os.path.join(ESTADO, "status"), 0o755)
+    with open(os.path.join(ESTADO, ".trava"), "w") as trava:
+        fcntl.flock(trava, fcntl.LOCK_EX)
+        lista = pessoas()
+        pedido(lista)
+        instalar(lista)
+        inventario(lista)
+
+
+if __name__ == "__main__": main()

@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+"""Atualiza a Ratoeira pela versão nova do produto (o repositório dobralabs/ratoeira). Roda como root, por três
+portas: o instalador, a unit ratoeira-atualizar (botão em Configurações › Atualizações e ferramenta
+atualizar_ratoeira do agente de um admin, que gravam um pedido) e o terminal, pra suporte.
+
+  ratoeira-atualizar estado            versão no ar, a do canal e a última tentativa
+  ratoeira-atualizar verificar         pergunta ao repositório se o canal tem versão nova (grava o estado)
+  ratoeira-atualizar aplicar [X.Y.Z]   monta e troca pra mais nova do canal (ou a pedida); volta sozinho se falhar
+  ratoeira-atualizar aplicar --local   aplica o que já está no clone, sem buscar nada (o instalador usa)
+  ratoeira-atualizar voltar            volta pra versão que estava antes da última atualização
+  ratoeira-atualizar conectar          liga esta Ratoeira a uma conta da plataforma (mostra um código pra digitar lá)
+  ratoeira-atualizar pedido            (unit) faz o que o gateway pediu em <pedidos>/pedido.json
+
+Como funciona (EMPACOTAMENTO.md, seção 5):
+  - O clone do produto mora em /opt/ratoeira/fonte, do root. Cada versão é uma tag vX.Y.Z; o canal (beta,
+    estavel) é um branch que aponta pra versão daquele canal.
+  - Quem troca o código é o publicar-core (o mesmo da nossa instância), chamado com a fonte do produto:
+    kit → regras → agentes → gateway. Gateway e agentes ficam em pastas por versão com atalho; o gateway
+    volta sozinho pro anterior se a versão nova não responder.
+  - Antes de trocar: cópia de /etc/ratoeira e do estado do gateway. Falhou no meio: volta o clone pra versão
+    de antes, restaura a cópia e reaplica o que já tinha trocado.
+  - O que o publicar-core não instala (ele mesmo, a regra do polkit, este script e as units dele, a unit do
+    gateway) vai pelo passo "sistema", daqui.
+  - Configuração, áreas, apps, dados e homes nunca são tocados (só a config do gateway passa pela migração
+    em degraus, com cópia antes).
+
+Fonte: /etc/ratoeira/fonte.json  {"remoto": "git@github.com:dobralabs/ratoeira.git", "canal": "beta"}
+  credencial, se o repositório é privado: /etc/ratoeira/fonte.chave (chave SSH só leitura) ou
+  /etc/ratoeira/fonte.token (token de leitura). Os dois do root, modo 600.
+  Desde 29/10/2026 o caminho normal é a plataforma: com /etc/ratoeira/plataforma.chave (a Ratoeira conectada a
+  uma conta, "conectar"), cada busca pede à plataforma um token do GitHub de 1 hora, que só sai com a Comunidade
+  Ratos ativa. Sem a Comunidade, a busca recusa com o motivo e a Ratoeira fica na versão que tem. A chave fixa e o
+  token em arquivo ficam só pra quem ainda não conectou (e pra suporte).
+Estado: /var/lib/ratoeira/core/atualizacao.json (o gateway lê pra tela de Atualizações).
+"""
+import base64, fcntl, urllib.error, urllib.request, uuid, importlib.machinery, importlib.util, json, os, re, shutil, stat, subprocess, sys, tempfile, time
+from datetime import datetime, timezone
+
+FONTE = os.environ.get("RATOEIRA_FONTE", "/opt/ratoeira/fonte")
+CFG_FONTE = os.environ.get("RATOEIRA_FONTE_CONFIG", "/etc/ratoeira/fonte.json")
+CHAVE = os.environ.get("RATOEIRA_FONTE_CHAVE", "/etc/ratoeira/fonte.chave")
+TOKEN = os.environ.get("RATOEIRA_FONTE_TOKEN_ARQUIVO", "/etc/ratoeira/fonte.token")
+CONHECIDOS = os.environ.get("RATOEIRA_FONTE_CONHECIDOS", "/etc/ratoeira/fonte.known_hosts")
+CHAVE_PLATAFORMA = os.environ.get("RATOEIRA_PLATAFORMA_CHAVE", "/etc/ratoeira/plataforma.chave")
+ID_INSTALACAO = os.environ.get("RATOEIRA_INSTALACAO_ID", "/etc/ratoeira/instalacao.id")
+PLATAFORMA = os.environ.get("RATOEIRA_PLATAFORMA", "https://plataforma.ratosdeia.com.br")
+CONFIG = os.environ.get("RATOEIRA_CONFIG", "/etc/ratoeira/gateway.config.json")
+ETC = os.path.dirname(CONFIG)
+TRABALHO = os.environ.get("RATOEIRA_CORE_TRABALHO", "/var/lib/ratoeira/core")
+ESTADO = os.path.join(TRABALHO, "atualizacao.json")
+PEDIDOS = os.environ.get("RATOEIRA_PEDIDOS_ATUALIZAR", "/var/lib/ratoeira/gateway-estado/atualizar")
+ESTADO_GATEWAY = os.environ.get("RATOEIRA_ESTADO_GATEWAY", "/var/lib/ratoeira/gateway-estado")
+USUARIO_GW = os.environ.get("RATOEIRA_USUARIO_GATEWAY", "ratoeira-gateway")
+CANAIS = ("beta", "estavel")
+ORDEM = ("kit", "regras", "agentes", "gateway")  # gateway por último: é o único que reinicia algo na hora
+VERSAO = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+GUARDAR_BACKUPS = 5
+
+# Arquivos de root que o publicar-core não instala de propósito (na nossa instância vão pela sessão de root);
+# numa instalação de aluno, quem instala é este passo.
+SISTEMA = {
+    "kit/multiusuario/50-ratoeira.rules": ("/etc/polkit-1/rules.d/50-ratoeira.rules", 0o644),
+    "kit/multiusuario/publicar-core": ("/usr/local/sbin/ratoeira-publicar-core", 0o755),
+    "kit/multiusuario/ratoeira-publicar-core@.service": ("/etc/systemd/system/ratoeira-publicar-core@.service", 0o644),
+    "kit/instalador/atualizar": ("/usr/local/sbin/ratoeira-atualizar", 0o755),
+    "kit/instalador/ratoeira-atualizar.service": ("/etc/systemd/system/ratoeira-atualizar.service", 0o644),
+    "kit/instalador/ratoeira-atualizar-verificar.service": ("/etc/systemd/system/ratoeira-atualizar-verificar.service", 0o644),
+    "kit/instalador/ratoeira-atualizar-verificar.timer": ("/etc/systemd/system/ratoeira-atualizar-verificar.timer", 0o644),
+    "kit/instalador/ratoeira-gateway.service": ("/etc/systemd/system/ratoeira-gateway.service", 0o644),
+    # backup fora da VPS (desde 28/10/2026): a tela de Segurança configura e liga o timer
+    "kit/backup/backup.py": ("/usr/local/lib/ratoeira-backup/backup.py", 0o644),
+    "kit/backup/sqlite_snapshot.py": ("/usr/local/lib/ratoeira-backup/sqlite_snapshot.py", 0o644),
+    "kit/backup/ratoeira-backup": ("/usr/local/sbin/ratoeira-backup", 0o755),
+    "kit/backup/ratoeira-backup.service": ("/etc/systemd/system/ratoeira-backup.service", 0o644),
+    "kit/backup/ratoeira-backup.timer": ("/etc/systemd/system/ratoeira-backup.timer", 0o644),
+    "kit/backup/ratoeira-backup-tela.service": ("/etc/systemd/system/ratoeira-backup-tela.service", 0o644),
+}
+
+# Páginas do produto em Apps (o Guia), trocadas inteiras a cada versão. As páginas que a pessoa pôs do lado ficam.
+PAGINAS = {"pages/guia": "/var/lib/ratoeira/pages/guia"}
+
+linhas_log = []
+
+
+def log(texto):
+    print(texto, flush=True)
+    linhas_log.append(texto)
+
+
+class Recusa(Exception):
+    pass
+
+
+def agora():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def carimbo():
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def gravar_json(caminho, dados, modo=0o644):
+    """Grava por um temporário de nome aleatório (mkstemp: O_EXCL, não segue symlink) e troca com os.replace."""
+    pasta = os.path.dirname(caminho)
+    os.makedirs(pasta, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=pasta, prefix="." + os.path.basename(caminho) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(dados, f, ensure_ascii=False, indent=1)
+            f.write("\n")
+            os.fchmod(f.fileno(), modo)
+        os.replace(tmp, caminho)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ── a pasta de pedidos é do usuário do gateway: o root nunca segue symlink nela ──
+
+NOFOLLOW = os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def abrir_pedidos():
+    """A pasta de pedidos, aberta sem seguir symlink (nem nela, nem no que tem dentro)."""
+    try:
+        return os.open(PEDIDOS, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW)
+    except OSError as e:
+        raise Recusa(f"Não consegui abrir a pasta de pedidos {PEDIDOS} ({e.strerror}).")
+
+
+def ler_pedido(dfd):
+    """O pedido.json, só se for arquivo regular (symlink, pasta ou fifo: recusa) e pequeno."""
+    try:
+        fd = os.open("pedido.json", os.O_RDONLY | os.O_NONBLOCK | NOFOLLOW, dir_fd=dfd)
+    except OSError:
+        raise Recusa("Não achei o pedido do gateway (ou não é um arquivo comum).")
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise Recusa("O pedido do gateway não é um arquivo comum.")
+        bruto = f.read(64 * 1024 + 1)
+    if len(bruto) > 64 * 1024:
+        raise Recusa("Pedido grande demais.")
+    try:
+        return json.loads(bruto.decode("utf-8"))
+    except ValueError:
+        raise Recusa("Pedido ilegível (não é JSON).")
+
+
+def gravar_resultado(dfd, dados):
+    """resultado.json na pasta de pedidos: temporário criado com O_CREAT|O_EXCL|O_NOFOLLOW e nome aleatório,
+    trocado com os.replace dentro da mesma pasta (rename não segue symlink no destino)."""
+    corpo = (json.dumps(dados, ensure_ascii=False, indent=1) + "\n").encode()
+    for _ in range(20):
+        nome = f".resultado.{os.urandom(8).hex()}.tmp"
+        try:
+            fd = os.open(nome, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o644, dir_fd=dfd)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise Recusa("Não consegui criar o arquivo de resultado.")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(corpo)
+            os.fchmod(f.fileno(), 0o644)
+        os.replace(nome, "resultado.json", src_dir_fd=dfd, dst_dir_fd=dfd)
+    except BaseException:
+        try:
+            os.unlink(nome, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+
+
+def ler_json(caminho, padrao=None):
+    try:
+        with open(caminho) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return padrao
+
+
+def num(v):
+    m = VERSAO.match(v or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def tag(v):
+    return "v" + v.lstrip("v")
+
+
+# ── git do clone do produto (como root: o repositório e a config dele são do root; buscar e trocar de versão
+#    não roda nada do conteúdo) ──
+
+TOKEN_PLATAFORMA = None  # o token de 1 hora que a plataforma deu nesta execução (só em memória)
+
+
+def cabecalho_token(env, token):
+    # pelo ambiente, não na linha de comando: no ps os outros usuários veriam
+    basico = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
+               GIT_CONFIG_VALUE_0=f"Authorization: Basic {basico}")
+
+
+def ambiente_git():
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": os.environ.get("RATOEIRA_GIT_HOME", "/root"), "LANG": "C.UTF-8",
+           "GIT_TERMINAL_PROMPT": "0"}
+    if TOKEN_PLATAFORMA:
+        cabecalho_token(env, TOKEN_PLATAFORMA)
+    elif os.path.isfile(CHAVE):
+        env["GIT_SSH_COMMAND"] = (f"ssh -i {CHAVE} -o IdentitiesOnly=yes -o BatchMode=yes "
+                                  f"-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={CONHECIDOS}")
+    elif os.path.isfile(TOKEN):
+        with open(TOKEN) as f:
+            cabecalho_token(env, f.read().strip())
+    return env
+
+
+def git(*args, timeout=120, checar=True):
+    r = subprocess.run(["git", "-c", "safe.directory=*", "-C", FONTE, *args], capture_output=True, text=True,
+                       timeout=timeout, env=ambiente_git())
+    if checar and r.returncode != 0:
+        raise Recusa(f"git {' '.join(args)}: {(r.stderr.strip().splitlines() or ['?'])[-1]}")
+    return r.stdout.strip()
+
+
+def config_fonte():
+    cfg = ler_json(CFG_FONTE, {}) or {}
+    canal = cfg.get("canal", "beta")
+    if canal not in CANAIS:
+        raise Recusa(f'Canal desconhecido em {CFG_FONTE}: "{canal}" (beta ou estavel).')
+    return cfg, canal
+
+
+# ── a plataforma: conta ligada a esta Ratoeira e o direito de buscar versão nova ──
+
+def ler_texto(caminho):
+    try:
+        with open(caminho) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def id_instalacao():
+    """Id fixo desta VPS na plataforma: reconectar a mesma Ratoeira troca a chave, não ocupa outra vaga da conta."""
+    atual = ler_texto(ID_INSTALACAO)
+    if atual and re.fullmatch(r"[a-f0-9-]{16,64}", atual):
+        return atual
+    novo = str(uuid.uuid4())
+    os.makedirs(os.path.dirname(ID_INSTALACAO), exist_ok=True)
+    with open(ID_INSTALACAO, "w") as f:
+        f.write(novo + "\n")
+    os.chmod(ID_INSTALACAO, 0o644)
+    return novo
+
+
+def endereco():
+    return (ler_json(CONFIG, {}) or {}).get("hostname") or os.uname().nodename
+
+
+def plataforma(caminho, corpo, chave=None, timeout=20):
+    """POST JSON na plataforma. Devolve (status, json); erro de rede vira Recusa."""
+    req = urllib.request.Request(PLATAFORMA.rstrip("/") + caminho, data=json.dumps(corpo).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": "ratoeira-atualizar",
+                                          **({"Authorization": f"Bearer {chave}"} if chave else {})})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            status, bruto = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        status, bruto = e.code, e.read()
+    except (urllib.error.URLError, OSError) as e:
+        raise Recusa(f"A plataforma não respondeu ({getattr(e, 'reason', e)}). Tenta de novo daqui a pouco.")
+    try:
+        return status, json.loads(bruto or b"{}")
+    except ValueError:
+        raise Recusa(f"A plataforma respondeu algo que não entendi (HTTP {status}). Tenta de novo daqui a pouco.")
+
+
+def https_do(remoto):
+    m = re.match(r"^(?:git@github\.com:|ssh://git@github\.com/)(.+?)(?:\.git)?$", remoto or "")
+    return f"https://github.com/{m.group(1)}.git" if m else remoto
+
+
+def licenca():
+    """Com a Ratoeira conectada: pede à plataforma o token do GitHub desta busca. Sem a Comunidade ativa, recusa com o
+    motivo (e a tela mostra). Devolve False se não está conectada (aí vale a credencial antiga, se tiver)."""
+    global TOKEN_PLATAFORMA
+    chave = ler_texto(CHAVE_PLATAFORMA)
+    if not chave:
+        gravar_estado(conexao={"estado": "desconectada"})
+        return False
+    no_ar = (estado().get("noAr") or {}).get("versao") or versao_no_clone()
+    status, d = plataforma("/api/ratoeira/atualizacao", {"versao": no_ar, "endereco": endereco()}, chave=chave)
+    conexao = {"estado": "conectada", "email": d.get("email"), "conferidoEm": agora()}
+    if status == 401:
+        conexao["estado"] = "desconhecida"
+    if d.get("ok") and d.get("token"):
+        TOKEN_PLATAFORMA = d["token"]
+        gravar_estado(conexao=conexao, licenca={"ok": True, "em": agora()})
+        log(f"plataforma: liberado ({d.get('email') or 'conta conectada'})")
+        return True
+    mensagem = d.get("mensagem") or f"A plataforma recusou (HTTP {status})."
+    if d.get("motivo") in ("sem-comunidade", "comunidade-vencida", "desconectada", "desconhecida"):
+        if d.get("motivo") == "desconectada":
+            conexao["estado"] = "desconectada"
+        gravar_estado(conexao=conexao, licenca={"ok": False, "motivo": d["motivo"], "mensagem": mensagem, "em": agora()})
+    raise Recusa(mensagem)
+
+
+def conectar(por="terminal"):
+    """Liga esta Ratoeira a uma conta da plataforma: mostra o código, espera a pessoa digitar e guarda a chave."""
+    status, d = plataforma("/api/ratoeira/dispositivo", {"instalacao": id_instalacao(), "endereco": endereco()})
+    if status != 200 or not d.get("segredo"):
+        raise Recusa(d.get("erro") or f"A plataforma não abriu o pedido de conexão (HTTP {status}).")
+    gravar_estado(conexao={"estado": "esperando", "codigo": d["codigo"], "url": d["url"], "expiraEm": d["expira_em"],
+                           "por": por})
+    log(f"Abre {d['url_curta']} (logado na tua conta da plataforma) e digita o código {d['codigo']}.")
+    log(f"Link direto: {d['url']} · vale 15 minutos.")
+    intervalo = max(2, int(d.get("intervalo") or 5))
+    fim = time.time() + 15 * 60 + 30
+    while time.time() < fim:
+        time.sleep(intervalo)
+        try:
+            status, r = plataforma("/api/ratoeira/dispositivo/chave", {"segredo": d["segredo"]})
+        except Recusa:
+            continue  # um soluço de rede não derruba a espera
+        if r.get("estado") == "esperando":
+            continue
+        if r.get("estado") == "conectada" and str(r.get("chave", "")).startswith("rat_"):
+            fd = os.open(CHAVE_PLATAFORMA + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(r["chave"] + "\n")
+            os.replace(CHAVE_PLATAFORMA + ".tmp", CHAVE_PLATAFORMA)
+            gravar_estado(conexao={"estado": "conectada", "email": r.get("email"), "em": agora()}, licenca=None)
+            log(f"conectada à conta {r.get('email') or '(sem e-mail)'}")
+            return
+        break
+    gravar_estado(conexao={"estado": "expirado"})
+    raise Recusa("O código venceu sem ninguém digitar. Pede outro.")
+
+
+def buscar():
+    """Busca as versões e os canais do repositório do produto."""
+    cfg, canal = config_fonte()
+    remoto = cfg.get("remoto")
+    pela_plataforma = licenca()
+    if pela_plataforma:
+        remoto = https_do(remoto) or "https://github.com/dobralabs/ratoeira.git"
+    if remoto and git("remote", "get-url", "origin", checar=False) != remoto:
+        git("remote", "set-url", "origin", remoto)
+    log(f"buscando versões em {git('remote', 'get-url', 'origin')} (canal {canal})")
+    try:
+        git("fetch", "--prune", "--prune-tags", "--tags", "--force", "origin",
+            "+refs/heads/*:refs/remotes/origin/*", timeout=300)
+    except Recusa as e:
+        if not pela_plataforma and "github.com" in (remoto or ""):
+            raise Recusa(f"{e}. Esta Ratoeira ainda não está conectada à plataforma: quem administra conecta em "
+                         "Configurações › Atualizações (ou sudo ratoeira-atualizar conectar).")
+        raise
+    return canal
+
+
+def versao_do_canal(canal):
+    commit = git("rev-parse", "-q", "--verify", f"refs/remotes/origin/{canal}^{{commit}}", checar=False)
+    if not commit:
+        raise Recusa(f'O repositório não tem o canal "{canal}".')
+    tags = [t for t in git("tag", "--points-at", commit).split() if num(t)]
+    if not tags:
+        raise Recusa(f'O canal "{canal}" aponta pra um commit sem versão (tag vX.Y.Z).')
+    return max(tags, key=num).lstrip("v")
+
+
+def versao_no_clone():
+    tags = [t for t in git("tag", "--points-at", "HEAD", checar=False).split() if num(t)]
+    if tags:
+        return max(tags, key=num).lstrip("v")
+    try:
+        with open(os.path.join(FONTE, "VERSION")) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def changelog_entre(de, ate):
+    """As entradas do CHANGELOG da versão nova, das mais novas até a primeira que já está no ar."""
+    try:
+        texto = git("show", f"{tag(ate)}:CHANGELOG.md")
+    except Recusa:
+        return []
+    entradas, atual = [], None
+    for linha in texto.splitlines():
+        m = re.match(r"^## (\d+\.\d+\.\d+)\b(.*)$", linha)
+        if m:
+            if de and num(m.group(1)) <= num(de):
+                break
+            atual = {"versao": m.group(1), "titulo": linha[3:].strip(), "texto": []}
+            entradas.append(atual)
+        elif atual is not None:
+            atual["texto"].append(linha)
+    for e in entradas:
+        e["texto"] = "\n".join(e["texto"]).strip()
+    return entradas[:10]
+
+
+# ── o publicar-core da versão que vai entrar ──
+
+def carregar_publicar_core():
+    caminho = os.path.join(FONTE, "kit", "multiusuario", "publicar-core")
+    if not os.path.isfile(caminho):
+        raise Recusa(f"Não achei o publicar-core em {caminho}.")
+    loader = importlib.machinery.SourceFileLoader("publicar_core", caminho)
+    spec = importlib.util.spec_from_loader("publicar_core", loader)
+    pc = importlib.util.module_from_spec(spec)
+    loader.exec_module(pc)
+    if "fonte_produto" not in pc.publicar.__code__.co_varnames:
+        raise Recusa("O publicar-core desta versão não sabe publicar a partir do produto.")
+    pc.log = log  # um log só, que vai pro estado
+    return pc
+
+
+def instalar_sistema():
+    """Os arquivos de root que o publicar-core não cobre. Só troca o que mudou; recarrega o systemd se precisar."""
+    trocou_unit = False
+    for rel, (destino, modo) in SISTEMA.items():
+        src = os.path.join(FONTE, rel)
+        if not os.path.isfile(src):
+            log(f"aviso: {rel} não está nesta versão; pulei")
+            continue
+        with open(src, "rb") as f:
+            novo = f.read()
+        try:
+            with open(destino, "rb") as f:
+                if f.read() == novo:
+                    continue
+        except FileNotFoundError:
+            pass
+        os.makedirs(os.path.dirname(destino), exist_ok=True)
+        tmp = destino + ".ratoeira-tmp"
+        with open(tmp, "wb") as f:
+            f.write(novo)
+        os.chown(tmp, 0, 0)
+        os.chmod(tmp, modo)
+        os.replace(tmp, destino)
+        log(f"trocado: {destino}")
+        trocou_unit |= destino.startswith("/etc/systemd/")
+    for rel, destino in PAGINAS.items():
+        src = os.path.join(FONTE, rel)
+        if not os.path.isdir(src):
+            continue
+        novo = destino + ".novo"
+        shutil.rmtree(novo, ignore_errors=True)
+        shutil.copytree(src, novo)
+        subprocess.run(["chmod", "-R", "u+rwX,go+rX,go-w", novo], check=True)
+        if os.path.isdir(destino):
+            shutil.rmtree(destino)
+        os.makedirs(os.path.dirname(destino), exist_ok=True)
+        os.rename(novo, destino)
+    if trocou_unit:
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "enable", "--now", "ratoeira-atualizar-verificar.timer"], capture_output=True)
+
+
+def migrar_config():
+    r = subprocess.run(["node", os.path.join(FONTE, "gateway", "config.mjs"), "migrar", CONFIG],
+                       capture_output=True, text=True, timeout=60)
+    saida = (r.stdout + r.stderr).strip()
+    if saida:
+        log("config: " + saida.splitlines()[-1])
+    if r.returncode != 0:
+        raise Recusa("A migração da config falhou (log acima). Nada foi trocado.")
+
+
+def copiar_estado(destino):
+    """Cópia do que a atualização pode mexer: /etc/ratoeira (config) e o estado do gateway (contas, sessões)."""
+    os.makedirs(destino, mode=0o700, exist_ok=True)
+    marca = os.path.join(destino, ".incompleta")  # sai no fim: cópia pela metade não serve pra restaurar
+    open(marca, "w").close()
+    subprocess.run(["cp", "-a", ETC, os.path.join(destino, "etc-ratoeira")], check=True)
+    if os.path.isdir(ESTADO_GATEWAY):
+        subprocess.run(["cp", "-a", ESTADO_GATEWAY, os.path.join(destino, "gateway-estado")], check=True)
+    os.remove(marca)
+    backups = os.path.dirname(destino)
+    velhos = sorted(n for n in os.listdir(backups) if n.startswith("atualizacao-"))
+    for n in velhos[:-GUARDAR_BACKUPS]:
+        shutil.rmtree(os.path.join(backups, n), ignore_errors=True)
+
+
+def restaurar_config(copia):
+    """Volta /etc/ratoeira/gateway.config.json (o único arquivo de /etc/ratoeira que a atualização muda)."""
+    salvo = os.path.join(copia, "etc-ratoeira", os.path.basename(CONFIG))
+    if os.path.exists(os.path.join(copia, ".incompleta")):
+        log("a cópia de antes não ficou inteira: não restaurei a config")
+        return
+    if os.path.isfile(salvo):
+        shutil.copy2(salvo, CONFIG)
+        log("config do gateway restaurada da cópia de antes")
+
+
+def estado():
+    return ler_json(ESTADO, {}) or {}
+
+
+def gravar_estado(**mudancas):
+    e = estado()
+    e.update(mudancas)
+    gravar_json(ESTADO, e)
+    return e
+
+
+# ── as ações ──
+
+def verificar():
+    canal = buscar()
+    no_ar = estado().get("noAr", {}).get("versao") or versao_no_clone()
+    disponivel = versao_do_canal(canal)
+    nova = bool(num(disponivel) and num(no_ar) and num(disponivel) > num(no_ar))
+    e = gravar_estado(canal=canal, verificadoEm=agora(), disponivel={
+        "versao": disponivel, "nova": nova, "mudancas": changelog_entre(no_ar, disponivel) if nova else []})
+    log(f"no ar: {no_ar or '?'} · canal {canal}: {disponivel}" + (" (nova)" if nova else " (em dia)"))
+    return e
+
+
+def aplicar(versao=None, local=False, por="terminal", voltando=False, do_gateway=False):
+    pc = None
+    if local:
+        alvo = versao_no_clone()
+        if not alvo:
+            raise Recusa("O clone do produto não tem versão (VERSION ou tag).")
+    else:
+        canal = buscar()
+        alvo = versao.lstrip("v") if versao else versao_do_canal(canal)
+        if not num(alvo):
+            raise Recusa(f"Versão inválida: {alvo}")
+        if not git("rev-parse", "-q", "--verify", f"refs/tags/{tag(alvo)}", checar=False):
+            raise Recusa(f"A versão {alvo} não existe no repositório.")
+        if versao and not voltando:
+            # versão pedida à mão tem que ser do histórico do canal (nada de tag solta de outro branch)
+            r = subprocess.run(["git", "-c", "safe.directory=*", "-C", FONTE, "merge-base", "--is-ancestor",
+                                f"refs/tags/{tag(alvo)}", f"refs/remotes/origin/{canal}"],
+                               capture_output=True, text=True, timeout=60, env=ambiente_git())
+            if r.returncode != 0:
+                raise Recusa(f"A versão {alvo} não faz parte do canal {canal}.")
+    anterior = estado().get("noAr") or {}
+    if do_gateway and versao and not voltando and num(anterior.get("versao")) and num(alvo) < num(anterior["versao"]):
+        raise Recusa(f"A {alvo} é mais velha que a {anterior['versao']}, que está no ar. Pra descer, use \"voltar\".")
+    if anterior.get("versao") == alvo and not local:
+        log(f"a {alvo} já está no ar")
+        return gravar_estado(ultima={"ok": True, "acao": "aplicar", "em": agora(), "por": por, "versao": alvo,
+                                     "log": linhas_log[-80:], "nada": True})
+    commit_antes = git("rev-parse", "HEAD", checar=False) or None
+    if shutil.disk_usage("/opt").free < 1.5e9:
+        raise Recusa("Menos de 1,5 GB livre no disco: libera espaço antes de atualizar.")
+    copia = os.path.join(TRABALHO, "backups", f"atualizacao-{carimbo()}")
+    log(f"{'voltando' if voltando else 'atualizando'} {anterior.get('versao') or '(primeira vez)'} → {alvo}")
+    feitas = []
+    try:
+        copiar_estado(copia)
+        if not local:
+            git("checkout", "-q", "--detach", "--force", tag(alvo))
+        git("clean", "-q", "-fdx", checar=False)
+        instalar_sistema()
+        migrar_config()
+        pc = carregar_publicar_core()
+        for parte in ORDEM:
+            log(f"── {parte}")
+            pc.publicar(parte, f"atualizador ({por})", fonte_produto=FONTE)
+            feitas.append(parte)
+    except Exception as e:
+        motivo = str(e) if isinstance(e, Recusa) or (pc and isinstance(e, pc.Recusa)) else f"{type(e).__name__}: {e}"
+        log(f"FALHOU: {motivo}")
+        if commit_antes and not local:
+            desfazer(commit_antes, feitas, copia, por)
+        else:
+            restaurar_config(copia)
+        gravar_estado(ultima={"ok": False, "acao": "voltar" if voltando else "aplicar", "em": agora(), "por": por,
+                              "versao": alvo, "erro": motivo, "log": linhas_log[-80:]})
+        raise Recusa(motivo + (" Voltei pra versão de antes." if commit_antes and not local else ""))
+    no_ar = {"versao": alvo, "commit": git("rev-parse", "--short=12", "HEAD"), "em": agora(), "por": por}
+    e = gravar_estado(noAr=no_ar, anterior=anterior if anterior.get("versao") != alvo else estado().get("anterior"),
+                      copiaAntes=copia, ultima={"ok": True, "acao": "voltar" if voltando else "aplicar", "em": agora(),
+                                                "por": por, "versao": alvo, "log": linhas_log[-80:]})
+    d = e.get("disponivel") or {}
+    if d.get("versao") and num(d["versao"]) <= num(alvo):
+        gravar_estado(disponivel={**d, "nova": False, "mudancas": []})
+    log(f"Ratoeira {alvo} no ar")
+    return e
+
+
+def desfazer(commit_antes, feitas, copia, por):
+    """Volta o clone pro commit de antes, restaura a config e reaplica as partes que já tinham trocado."""
+    log("voltando pra versão de antes")
+    try:
+        git("checkout", "-q", "--detach", "--force", commit_antes)
+        restaurar_config(copia)
+        instalar_sistema()
+        if feitas:
+            pc = carregar_publicar_core()
+            for parte in feitas:
+                if parte == "gateway":
+                    continue  # o publicar-core já voltou o atalho do gateway se ele não subiu
+                log(f"── {parte} (de volta)")
+                pc.publicar(parte, f"atualizador ({por}), voltando", fonte_produto=FONTE)
+    except Exception as e:  # o resto do log diz o que ficou pela metade
+        log(f"ERRO ao voltar: {type(e).__name__}: {e}. Na VPS: ratoeira-atualizar estado")
+
+
+def voltar(por="terminal"):
+    anterior = (estado().get("anterior") or {}).get("versao")
+    if not anterior:
+        raise Recusa("Não tem versão anterior registrada pra voltar.")
+    copia = estado().get("copiaAntes")
+    e = aplicar(anterior, por=por, voltando=True)
+    # a config de antes da última migração (voltar o código não desfaz migração)
+    if copia and os.path.isdir(copia):
+        restaurar_config(copia)
+        subprocess.run(["systemctl", "restart", "ratoeira-gateway"])
+    return e
+
+
+def mostrar_estado():
+    e = estado()
+    no_ar, d, u = e.get("noAr") or {}, e.get("disponivel") or {}, e.get("ultima") or {}
+    print(f"No ar: {no_ar.get('versao', '?')} (desde {no_ar.get('em', '?')})")
+    print(f"Canal: {e.get('canal', config_fonte()[1])} · disponível: {d.get('versao', '?')}"
+          + (" (nova)" if d.get("nova") else "") + f" · verificado em {e.get('verificadoEm', 'nunca')}")
+    c, lic = e.get("conexao") or {}, e.get("licenca") or {}
+    print("Plataforma: " + {"conectada": f"conectada ({c.get('email') or '?'})", "esperando": f"esperando o código {c.get('codigo')}",
+                            }.get(c.get("estado"), "não conectada (sudo ratoeira-atualizar conectar)")
+          + ("" if lic.get("ok") is not False else f" · sem versão nova: {lic.get('mensagem')}"))
+    if u:
+        print(f"Última: {u.get('acao')} {u.get('versao', '')} em {u.get('em')}: {'ok' if u.get('ok') else 'falhou: ' + str(u.get('erro'))}")
+
+
+ACOES_PEDIDO = ("verificar", "aplicar", "voltar", "conectar")
+
+
+def atender_pedido():
+    """Pedido do gateway (botão ou ferramenta do agente): {"acao": "verificar|aplicar|voltar", "versao"?, "por"}.
+    Sempre grava o resultado e apaga o pedido, dê certo ou errado (senão a tela fica esperando)."""
+    dfd = abrir_pedidos()
+    resultado = {"acao": None, "em": agora(), "por": "gateway"}
+    try:
+        try:
+            pedido = ler_pedido(dfd)
+            if not isinstance(pedido, dict):
+                raise Recusa("O pedido do gateway não é um objeto.")
+            acao, por = pedido.get("acao"), str(pedido.get("por", ""))[:200] or "gateway"
+            versao = pedido.get("versao")
+            resultado.update(acao=acao if acao in ACOES_PEDIDO else None, por=por)
+            if acao not in ACOES_PEDIDO:
+                raise Recusa(f"Ação desconhecida: {str(acao)[:40]}")
+            if versao is not None and (not isinstance(versao, str) or not num(versao)):
+                raise Recusa("Versão inválida no pedido.")
+            if acao == "verificar":
+                verificar()
+            elif acao == "conectar":
+                conectar(por=por)
+                try:
+                    verificar()  # já mostra se a conta libera versão nova
+                except Recusa as e:
+                    log(f"conectada, mas: {e}")
+            elif acao == "aplicar":
+                aplicar(versao, por=por, do_gateway=True)
+            else:
+                voltar(por=por)
+            resultado["ok"] = True
+        except Recusa as e:
+            resultado.update(ok=False, erro=str(e))
+        except Exception as e:  # qualquer outra falha também vira resultado
+            resultado.update(ok=False, erro=f"{type(e).__name__}: {e}")
+        resultado["log"] = linhas_log[-80:]
+        gravar_resultado(dfd, resultado)
+        try:
+            os.unlink("pedido.json", dir_fd=dfd)  # unlink não segue symlink: apaga o próprio link, se for um
+        except OSError:
+            pass
+    finally:
+        os.close(dfd)
+    return resultado["ok"]
+
+
+def main():
+    if os.geteuid() != 0:
+        print("Roda como root (sudo ratoeira-atualizar …).", file=sys.stderr)
+        sys.exit(2)
+    args = sys.argv[1:]
+    acao = args[0] if args else "estado"
+    os.makedirs(TRABALHO, mode=0o755, exist_ok=True)
+    if acao == "estado":
+        mostrar_estado()
+        return
+    # uma coisa de cada vez, e nunca junto com uma publicação do publicar-core (mesma trava)
+    trava = open(os.path.join(TRABALHO, ".trava"), "w")
+    fcntl.flock(trava, fcntl.LOCK_EX)
+    try:
+        if acao == "verificar":
+            verificar()
+        elif acao == "aplicar":
+            local = "--local" in args
+            versoes = [a for a in args[1:] if not a.startswith("--")]
+            aplicar(versoes[0] if versoes else None, local=local, por=os.environ.get("SUDO_USER") or "terminal")
+        elif acao == "voltar":
+            voltar(por=os.environ.get("SUDO_USER") or "terminal")
+        elif acao == "conectar":
+            conectar(por=os.environ.get("SUDO_USER") or "terminal")
+            verificar()
+        elif acao == "pedido":
+            sys.exit(0 if atender_pedido() else 1)
+        else:
+            print(__doc__)
+            sys.exit(2)
+    except Recusa as e:
+        print(f"\nNão deu: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

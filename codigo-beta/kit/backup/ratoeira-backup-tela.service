@@ -1,0 +1,13 @@
+# Pedido da tela de Segurança pro backup (configurar o destino, rodar agora, ligar, desligar), como root: o gateway
+# grava o pedido e dá "start" (regra do polkit). Também só atualiza o estado que a tela lê, quando não tem pedido.
+# Outro caminho ou outro grupo: drop-in em /etc/systemd/system/ratoeira-backup-tela.service.d/local.conf
+[Unit]
+Description=Ratoeira - pedido da tela pro backup
+
+[Service]
+Type=oneshot
+UMask=0077
+Environment=RATOEIRA_GRUPO=ratoeira-gw
+Environment=RATOEIRA_BACKUP_PEDIDO=/var/lib/ratoeira/gateway-estado/backup-pedido.json
+ExecStart=/usr/local/sbin/ratoeira-backup tela
+TimeoutStartSec=600

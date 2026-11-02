@@ -1,0 +1,138 @@
+/* Boas-vindas, tour, lista "Primeiros passos" e Configurações › Endereços (boas-vindas.js). Design Ilha: tokens do portal.css. */
+
+/* ── A janela de passos ── */
+dialog.bv{border:0;border-radius:var(--r-island);padding:0;width:min(600px,calc(100vw - 32px));max-height:calc(100dvh - 32px);background:var(--island);color:var(--ink);box-shadow:var(--shadow-up);display:flex;flex-direction:column;overflow:hidden}
+dialog.bv:not([open]){display:none}
+dialog.bv::backdrop{background:rgba(20,20,18,.42)}
+.bv-cab{padding:22px 26px 6px}
+.bv-cab h2{font-family:var(--display);font-weight:700;font-size:22px;line-height:1.2;margin:12px 0 0;letter-spacing:-.01em}
+.bv-sub{margin:8px 0 0;color:var(--ink2);line-height:1.55}
+.bv-dots{display:flex;gap:5px}
+.bv-dots i{width:18px;height:4px;border-radius:99px;background:var(--line)}
+.bv-dots i.feito{background:var(--ink2)}
+.bv-dots i.atual{background:var(--accent);width:28px}
+.bv-corpo{padding:14px 26px 6px;overflow:auto;line-height:1.55;color:var(--ink2);min-height:40px}
+.bv-corpo>p{margin:0 0 10px}
+.bv-roteiro{margin:4px 0 6px;padding-left:20px;display:grid;gap:4px;color:var(--ink)}
+.bv-pe{display:flex;align-items:center;gap:8px;padding:14px 26px 20px;border-top:1px solid var(--line-soft);margin-top:12px}
+.bv-espaco{flex:1}
+.bv-link{border:0;background:none;padding:6px 4px;color:var(--muted);font-size:13px;cursor:pointer;text-decoration:underline;text-underline-offset:3px;text-decoration-color:var(--line)}
+.bv-link:hover{color:var(--ink);background:none}
+.bv-nota{font-size:12.5px;color:var(--muted);margin:10px 0 0}
+.bv-grande{margin:6px 0 4px;height:38px;padding:0 18px}
+
+.bv-estado{display:flex;align-items:center;gap:8px;padding:11px 14px;border-radius:var(--r);background:var(--surface);color:var(--ink2);margin:2px 0 12px}
+.bv-estado.ok{background:rgba(63,154,92,.11);color:var(--success)}
+.bv-estado svg{width:18px;height:18px;flex:none;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+
+/* opções de onde mora o trabalho */
+.bv-opcoes{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:4px 0 14px}
+.bv-opcao{display:flex;flex-direction:column;align-items:flex-start;justify-content:flex-start;gap:10px;height:auto;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--island);text-align:left;cursor:pointer;color:var(--ink)}
+.bv-opcao:hover{background:var(--hover)}
+.bv-opcao.sel{border-color:var(--accent-line);background:var(--accent-soft);box-shadow:0 0 0 1px var(--accent-line)}
+.bv-opcao-ic{width:32px;height:32px;border-radius:9px;background:var(--surface);display:grid;place-items:center}
+.bv-opcao.sel .bv-opcao-ic{background:var(--island)}
+.bv-opcao-ic svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.bv-opcao-tx{display:flex;flex-direction:column;gap:2px}
+.bv-opcao-tx strong{font-size:13.5px;font-weight:600}
+.bv-opcao-tx span{font-size:12px;color:var(--muted);line-height:1.4}
+.bv-detalhe:empty{display:none}
+.bv-detalhe>p{margin:0 0 10px}
+.bv-detalhe>button{margin-bottom:2px}
+.bv-sub-op{border:1px solid var(--line);border-radius:12px;padding:0 14px;margin:0 0 8px}
+.bv-sub-op summary{cursor:pointer;padding:11px 0;font-weight:600;color:var(--ink)}
+.bv-sub-op[open]{padding-bottom:12px}
+.bv-sub-op p{margin:0 0 10px}
+
+.bv-copiar{position:relative;margin:0 0 10px}
+.bv-copiar pre{margin:0;max-height:170px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:var(--surface);border-radius:var(--r);padding:12px 14px 12px;font:12px/1.55 var(--mono);color:var(--ink2)}
+.bv-copiar-btn{position:absolute;top:8px;right:8px;height:28px;padding:0 10px;font-size:12px;display:inline-flex;align-items:center;gap:5px;background:var(--island)}
+.bv-copiar-btn svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+
+.bv-aviso{display:flex;gap:10px;padding:12px 14px;border-radius:var(--r);background:var(--accent-soft);color:var(--ink2);font-size:13px;line-height:1.5;margin:4px 0 6px}
+.bv-aviso>svg{width:18px;height:18px;flex:none;margin-top:1px;fill:none;stroke:var(--accent-text);stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.bv-aviso strong{color:var(--ink)}
+.bv-aviso-btn{display:block;margin-top:8px;height:28px;padding:0 10px;font-size:12px;background:var(--island)}
+
+/* integrações */
+.bv-int{display:grid;gap:14px}
+.bv-bloco h3{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:600;color:var(--ink);margin:0 0 6px}
+.bv-bloco h3 svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;color:var(--muted)}
+.bv-bloco p{margin:0 0 6px}
+.bv-lista3{margin:0;padding-left:18px;display:grid;gap:4px}
+.bv-lista3 strong{color:var(--ink);font-weight:600}
+.bv-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px}
+.bv-cartao{border:1px solid var(--line);border-radius:12px;padding:12px 14px;display:flex;flex-direction:column;gap:4px}
+.bv-cartao strong{color:var(--ink)}
+.bv-cartao p{margin:0 0 6px;font-size:12.5px;color:var(--muted);flex:1}
+.bv-cartao button{align-self:flex-start;height:30px;font-size:12.5px}
+
+/* lingueta: a janela minimizada enquanto a pessoa faz o passo noutra tela. Presa na borda direita, a 30% da altura:
+   longe da caixa do chat, que fica no pé (conversa aberta) ou no meio (conversa nova); abaixo dos menus (--z-pop) */
+.bv-pilula{position:fixed;right:0;top:30%;transform:translateY(-50%);z-index:calc(var(--z-pop) - 1);width:22px;height:auto;min-height:0;padding:10px 0;border:0;border-radius:9px 0 0 9px;display:flex;flex-direction:column;align-items:center;gap:7px;background:var(--island);color:var(--ink2);box-shadow:var(--shadow-up),0 0 0 1px var(--line);cursor:pointer;transition:width .15s var(--ease),color .15s}
+.bv-pilula:hover,.bv-pilula:focus-visible{width:28px;color:var(--ink);background:var(--island)}
+.bv-pilula:active{transform:translateY(-50%)}
+.bv-pilula .dot{flex:none;margin:0}
+.bv-pilula-t{writing-mode:vertical-rl;transform:rotate(180deg);font-size:11.5px;font-weight:600;letter-spacing:.02em;line-height:1;white-space:nowrap}
+
+/* ── Tour ── */
+.bv-tour{position:fixed;inset:0;z-index:calc(var(--z-skip) + 5)}
+.bv-luz{position:fixed;border-radius:12px;box-shadow:0 0 0 9999px rgba(20,20,18,.5),0 0 0 2px var(--accent);transition:all .25s var(--ease);pointer-events:none}
+.bv-balao{position:fixed;background:var(--island);color:var(--ink);border-radius:var(--r-island);box-shadow:var(--shadow-up);padding:16px 18px 12px;transition:left .25s var(--ease),top .25s var(--ease)}
+.bv-balao h3{font-family:var(--display);font-weight:700;font-size:17px;margin:4px 0 6px}
+.bv-balao p{margin:0;color:var(--ink2);line-height:1.55}
+.bv-balao-n{font-size:11.5px;color:var(--muted)}
+.bv-balao-ac{display:flex;align-items:center;gap:6px;margin-top:14px}
+.bv-balao-ac button{height:30px}
+
+/* ── Lista "Primeiros passos" (Início) ── */
+.bv-passos{grid-column:1/-1}
+.bv-passos .ch h2 .dot{margin-right:2px}
+.bv-barra{height:4px;border-radius:99px;background:var(--surface);overflow:hidden}
+.bv-barra i{display:block;height:100%;background:var(--accent);border-radius:99px;transition:width .4s var(--ease)}
+.bv-itens{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:1fr 1fr;gap:2px 16px}
+.bv-itens li{display:flex;align-items:center;gap:10px;padding:8px 6px;border-radius:var(--r);min-width:0}
+.bv-itens li:hover{background:var(--hover)}
+.bv-ck{width:20px;height:20px;flex:none;border-radius:99px;border:1.5px solid var(--line);display:grid;place-items:center}
+.bv-itens li.feito .bv-ck{background:var(--ok);border-color:var(--ok);color:#fff}
+.bv-ck svg{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+.bv-it-tx{display:flex;flex-direction:column;min-width:0;flex:1}
+.bv-it-tx strong{font-weight:600;font-size:13px;color:var(--ink)}
+.bv-it-tx span{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bv-itens li.feito strong{color:var(--muted);text-decoration:line-through;text-decoration-color:var(--line)}
+.bv-it-btn{height:28px;padding:0 10px;font-size:12px;flex:none}
+.bv-passos-pe{display:flex;align-items:center;gap:8px;margin-top:-2px}
+
+/* menu da conta: o ícone do "Rever as boas-vindas" segue o dos outros itens */
+#eu-boas-vindas svg{fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+
+/* ── Configurações › Endereços ── */
+.bv-end{display:flex;flex-direction:column;gap:12px;margin-bottom:12px}
+.bv-end h3{margin:0;font-size:15px}
+.bv-end-cab p{margin:2px 0 0;font-size:13px}
+.bv-end-atual{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font:13.5px var(--mono)}
+.bv-end-atual a{color:var(--ink)}
+.bv-end-atual .chip{font-family:var(--sans)}
+.bv-end-form{display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap}
+.bv-end-form label{flex:1;min-width:220px;margin:0}
+.bv-end-form input{margin-bottom:0}
+.bv-end-form .actions{margin:0}
+.bv-end-res:empty{display:none}
+.bv-end-res p{margin:0 0 8px}
+.bv-end-ok{display:flex;align-items:center;gap:7px;color:var(--success);font-weight:600}
+.bv-end-ok svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.bv-end-nao{color:var(--ink)}
+.bv-end-dns{margin:0;padding-left:20px;display:grid;gap:5px;color:var(--ink2);line-height:1.5}
+.bv-end-dns code,.bv-end-ip{font-family:var(--mono);font-size:12.5px}
+.bv-end-dns code{background:var(--surface);padding:1px 6px;border-radius:5px}
+.bv-end-ip{margin:0}
+
+@media (max-width:760px){
+  .bv-cab,.bv-corpo{padding-left:18px;padding-right:18px}
+  .bv-pe{padding:12px 18px 16px;flex-wrap:wrap}
+  .bv-opcoes{grid-template-columns:1fr}
+  .bv-opcao{flex-direction:row;align-items:center}
+  .bv-itens{grid-template-columns:1fr}
+  .bv-pilula{width:30px;padding:14px 0}
+  .bv-it-btn,.bv-balao-ac button,.bv-cartao button{height:40px}
+}

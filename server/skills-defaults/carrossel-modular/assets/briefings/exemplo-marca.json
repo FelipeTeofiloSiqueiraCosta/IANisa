@@ -1,0 +1,32 @@
+{
+  "marca": "Oscar Balbino",
+  "handle": "@oscarbalbino",
+  "nicho": "Tech/SaaS",
+  "cor_primaria": "#0A192F",
+  "cor_acento": "#64FFDA",
+  "estilo": "Moderno",
+  "fonte_display": "Barlow Condensed",
+  "fonte_body": "Plus Jakarta Sans",
+  "tipo_carrossel_default": "Tese contraintuitiva",
+  "cta_default": "Comenta GUIA pra eu mandar a versão completa",
+  "slides_default": 9,
+  "imagens_default": 1,
+  "engine_default": "A",
+  "tom_voz": "Direto, sem entusiasmo falso. Discorda quando algo não faz sentido. Empresário falando com empresário, não criador falando com seguidor.",
+  "template_base": null,
+  "hashtags_fixas": [
+    "#empresariobr",
+    "#produtividadeIA"
+  ],
+  "expressoes_assinatura": [
+    "drena caixa",
+    "voa baixo",
+    "redução de custo > escala"
+  ],
+  "expressoes_proibidas": [
+    "imersão",
+    "metodologia",
+    "jornada",
+    "transformação"
+  ]
+}

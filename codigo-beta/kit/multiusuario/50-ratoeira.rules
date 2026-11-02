@@ -1,0 +1,32 @@
+// Ações que o gateway da Ratoeira pode pedir ao systemd, e nada além disso:
+// - ligar e desligar o servidor de agentes de uma pessoa (chat e terminal da Ratoeira, ratoeira-agentes@);
+// - criar uma pessoa quando o admin convida alguém com ambiente próprio (ratoeira-adicionar@);
+// - aplicar áreas e pastas restritas (ratoeira-acessos);
+// - instalar automações e montar o inventário de automações e integrações (ratoeira-automacoes);
+// - publicar um app (ratoeira-publicar@, docs/2026-10-09-publicar-app-sem-sudo.md);
+// - publicar uma parte da própria Ratoeira (ratoeira-publicar-core@, docs/2026-10-09-publicar-core.md);
+// - ligar e desligar o navegador de uma pessoa (ratoeira-navegador@), pra tela ao vivo;
+// - atualizar a Ratoeira pela versão nova do produto (ratoeira-atualizar, só nas instalações dos alunos:
+//   kit/instalador/atualizar; a nossa não tem a unit, então a linha não faz nada aqui).
+// - o pedido da tela de Segurança pro backup fora da VPS (ratoeira-backup-tela, kit/backup).
+// E cada pessoa da Ratoeira (grupo ratoeira-pessoas) liga e desliga o próprio navegador, e só o dela
+// (comando ratoeira-navegador, que o agente dela chama).
+// Copiar pra /etc/polkit-1/rules.d/ e trocar o usuário do gateway se não for "ratoeira-gateway".
+polkit.addRule(function(action, subject) {
+  if (action.id != "org.freedesktop.systemd1.manage-units" || subject.user != "ratoeira-gateway") return;
+  var verbo = action.lookup("verb"), unit = action.lookup("unit");
+  if ((verbo == "start" || verbo == "stop") && /^ratoeira-agentes@[a-z_][a-z0-9_-]{0,31}\.service$/.test(unit)) return polkit.Result.YES;
+  if (verbo == "start" && /^ratoeira-adicionar@[a-z_][a-z0-9_-]{0,31}\.service$/.test(unit)) return polkit.Result.YES;
+  if (verbo == "start" && unit == "ratoeira-acessos.service") return polkit.Result.YES;
+  if (verbo == "start" && unit == "ratoeira-automacoes.service") return polkit.Result.YES;
+  if (verbo == "start" && /^ratoeira-publicar@[a-z][a-z0-9-]{1,30}\.service$/.test(unit)) return polkit.Result.YES;
+  if ((verbo == "start" || verbo == "stop") && /^ratoeira-navegador@[a-z_][a-z0-9_-]{0,31}\.service$/.test(unit)) return polkit.Result.YES;
+  if (verbo == "start" && /^ratoeira-publicar-core@(telas|gateway|agentes|regras|kit|receita|pacotes)\.service$/.test(unit)) return polkit.Result.YES;
+  if (verbo == "start" && (unit == "ratoeira-atualizar.service" || unit == "ratoeira-atualizar-verificar.service")) return polkit.Result.YES;
+  if (verbo == "start" && unit == "ratoeira-backup-tela.service") return polkit.Result.YES;
+});
+polkit.addRule(function(action, subject) {
+  if (action.id != "org.freedesktop.systemd1.manage-units" || !subject.isInGroup("ratoeira-pessoas")) return;
+  var verbo = action.lookup("verb"), unit = action.lookup("unit");
+  if ((verbo == "start" || verbo == "stop") && unit == "ratoeira-navegador@" + subject.user + ".service") return polkit.Result.YES;
+});

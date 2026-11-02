@@ -1,0 +1,12 @@
+# Uma vez por dia de madrugada, no fuso da máquina. A tela liga e desliga (systemctl enable/disable).
+[Unit]
+Description=Ratoeira - backup diário
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=ratoeira-backup.service
+
+[Install]
+WantedBy=timers.target

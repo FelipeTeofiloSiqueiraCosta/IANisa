@@ -1,0 +1,30 @@
+# Navegador da Ratoeira de uma pessoa: ratoeira-navegador@<usuário Linux>.service (agentes/navegador.mjs).
+# Google Chrome com tela virtual e o perfil dela (~/.local/share/ratoeira/navegador/perfil), servido num endereço
+# com código secreto que só ela lê (/run/ratoeira-navegador-<usuário>/estado.json). Liga quando o agente dela pede
+# (comando ratoeira-navegador; o polkit deixa cada pessoa ligar e desligar só o dela) e sai sozinho depois de
+# NAVEGADOR_OCIOSO_MIN minutos sem ninguém conectado. Unit própria, com teto de memória próprio: um site pesado
+# não derruba as conversas, que ficam no ratoeira-agentes@ (MemoryMax de lá).
+[Unit]
+Description=Ratoeira - navegador de %i
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+Environment=PATH=/opt/ratoeira/bin:/usr/local/bin:/usr/bin:/bin
+Environment=NAVEGADOR_OCIOSO_MIN=3
+WorkingDirectory=~
+# Travas: nada de usuário de sistema ou com sudo de grupo (o polkit deixa ligar qualquer nome).
+ExecStartPre=+/bin/sh -c 'u=%i; [ "$$(id -u $$u)" -ge 1000 ] && ! id -nG $$u | tr " " "\n" | grep -qxE "sudo|wheel|admin|root"'
+ExecStart=/usr/bin/node /opt/ratoeira/agentes/navegador.mjs
+RuntimeDirectory=ratoeira-navegador-%i
+RuntimeDirectoryMode=0700
+UMask=0077
+Restart=no
+# SIGTERM só no node, que fecha o Chrome pelo Browser.close (grava o login); o resto morre depois
+KillMode=mixed
+TimeoutStopSec=25
+MemoryMax=1200M
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes

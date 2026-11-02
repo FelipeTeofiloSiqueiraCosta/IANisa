@@ -1,0 +1,8 @@
+node_modules/
+.env
+public/markdown.js
+public/markdown.js.gz
+public/markdown.json
+public/screenshot.js
+public/editor.js
+public/terminal.js

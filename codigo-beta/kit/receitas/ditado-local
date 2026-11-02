@@ -1,0 +1,114 @@
+#!/bin/bash
+# Ditado local da Ratoeira: transcrição de fala na própria VPS, sem chave nem internet, pro botão de microfone do
+# chat. Vem de fábrica; com chave do AssemblyAI (Configurações › Organização › Ditado, ou o cofre) o motor local nem acorda.
+# Receita: roda como root pelo chat de um admin (rodar_receita, nome "ditado-local") ou à mão: sudo ./ditado-local
+# Precisa do servidor de agentes publicado com o agentes/ditado-local.mjs (o serviço roda de lá).
+# - motor: sherpa-onnx-node (binário pronto, sem compilar) em /opt/ratoeira/ditado/node_modules
+# - modelo: NVIDIA Parakeet TDT 0.6B v3 int8 (português, ~670 MB) em /opt/ratoeira/modelos/parakeet-tdt-0.6b-v3-int8
+# - serviço: ratoeira-ditado.socket (sempre de pé, não gasta nada) liga o ratoeira-ditado.service na primeira fala;
+#   ele carrega o modelo (~1,1 GB de RAM) e sai sozinho depois de 10 min parado
+# - ffmpeg (apt), pra ler o áudio que o navegador grava
+# Motor local: transcrição na própria VPS, sem chave; o modelo fica carregado só enquanto alguém fala.
+set -euo pipefail
+[ "$(id -u)" = 0 ] || { echo "Rode com sudo."; exit 1; }
+SHERPA=1.13.8
+MOTOR=/opt/ratoeira/ditado
+MODELO=/opt/ratoeira/modelos/parakeet-tdt-0.6b-v3-int8
+URL=https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2
+SERVICO=/opt/ratoeira/agentes/ditado-local.mjs
+SOCKET=/run/ratoeira-ditado/ditado.sock
+
+[ -f "$SERVICO" ] || { echo "Falta $SERVICO: publique o servidor de agentes (publicar_ratoeira agentes) antes desta receita."; exit 1; }
+
+# 1. ffmpeg
+if ! command -v ffmpeg >/dev/null; then
+  echo "instalando o ffmpeg"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q ffmpeg
+fi
+
+# 2. motor (com o binário da plataforma, que é dependência opcional do pacote)
+install -d -m 755 "$MOTOR"
+if [ "$(node -p "try{require('$MOTOR/node_modules/sherpa-onnx-node/package.json').version}catch{''}")" != "$SHERPA" ]; then
+  echo "instalando o sherpa-onnx-node $SHERPA"
+  echo '{"name":"ratoeira-ditado-motor","private":true}' > "$MOTOR/package.json"
+  (cd "$MOTOR" && npm install --no-audit --no-fund --save-exact "sherpa-onnx-node@$SHERPA")
+fi
+chmod -R a+rX "$MOTOR"
+
+# 3. modelo (só os 4 arquivos que o motor usa). O original vem em .tar.bz2 e nem toda VPS tem bzip2: abre pelo Python.
+if [ ! -s "$MODELO/tokens.txt" ] || [ "$(stat -c %s "$MODELO/encoder.int8.onnx" 2>/dev/null || echo 0)" -lt 100000000 ]; then
+  echo "baixando o modelo (~465 MB)"
+  TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+  curl -fL --retry 3 --progress-bar -o "$TMP/modelo.tar.bz2" "$URL"
+  echo "abrindo o modelo (leva uns minutos)"
+  python3 - "$TMP/modelo.tar.bz2" "$TMP" <<'PY'
+import sys, tarfile
+quero = {"encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"}
+with tarfile.open(sys.argv[1], "r:bz2") as t:
+    membros = [m for m in t.getmembers() if m.isfile() and m.name.split("/")[-1] in quero]
+    for m in membros: m.name = m.name.split("/")[-1]
+    t.extractall(sys.argv[2] + "/modelo", members=membros)
+PY
+  install -d -m 755 "$MODELO"
+  for f in encoder.int8.onnx decoder.int8.onnx joiner.int8.onnx tokens.txt; do install -m 644 "$TMP/modelo/$f" "$MODELO/$f"; done
+fi
+
+# 4. serviço
+cat > /etc/systemd/system/ratoeira-ditado.socket <<EOF
+# Ditado local da Ratoeira (kit/receitas/ditado-local): o socket fica de pé e liga o serviço na primeira fala.
+[Unit]
+Description=Ratoeira - ditado local (socket)
+
+[Socket]
+ListenStream=$SOCKET
+SocketMode=0666
+DirectoryMode=0755
+
+[Install]
+WantedBy=sockets.target
+EOF
+cat > /etc/systemd/system/ratoeira-ditado.service <<EOF
+# Ditado local da Ratoeira (kit/receitas/ditado-local): Parakeet v3 pelo sherpa-onnx, um processo pra máquina toda.
+# Ligado pelo ratoeira-ditado.socket; sai sozinho depois de DITADO_OCIOSO_MIN parado (o socket liga de novo).
+[Unit]
+Description=Ratoeira - ditado local
+Requires=ratoeira-ditado.socket
+After=ratoeira-ditado.socket
+
+[Service]
+Type=simple
+DynamicUser=yes
+Environment=NODE_PATH=$MOTOR/node_modules
+Environment=DITADO_MODELO=$MODELO
+Environment=DITADO_THREADS=2
+Environment=DITADO_OCIOSO_MIN=10
+# /opt/ratoeira/agentes é atalho pra versão no ar: roda pelo caminho resolvido (e pega a versão nova ao religar)
+ExecStart=/bin/sh -c 'exec /usr/bin/node "\$\$(readlink -f $SERVICO)"'
+# os agentes de cada pessoa têm prioridade na CPU; o ditado usa o que sobrar
+Nice=5
+MemoryMax=2G
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+EOF
+systemctl daemon-reload
+# tentativa anterior que falhou deixa o socket travado (start-limit-hit): limpa e liga de novo
+systemctl reset-failed ratoeira-ditado.socket ratoeira-ditado.service 2>/dev/null || true
+systemctl enable ratoeira-ditado.socket
+systemctl restart ratoeira-ditado.socket
+# serviço em pé com versão antiga do código: reinicia (a próxima fala carrega de novo)
+systemctl try-restart ratoeira-ditado.service || true
+
+# 5. confere: uma frase de verdade, do jeito que o navegador manda (webm/opus)
+echo "conferindo (a primeira fala carrega o modelo, uns 10 s)"
+TESTE=$(mktemp -d); trap 'rm -rf "$TESTE" ${TMP:-}' EXIT
+ffmpeg -loglevel error -f lavfi -i "sine=f=440:d=2" -c:a libopus -b:a 32k "$TESTE/teste.webm"
+R=$(curl -sf --max-time 300 --unix-socket "$SOCKET" -X POST --data-binary @"$TESTE/teste.webm" http://localhost/transcrever) || {
+  echo "O serviço não respondeu. journalctl -u ratoeira-ditado:"; journalctl -u ratoeira-ditado --no-pager -n 30; exit 1; }
+echo "$R" | grep -q '"texto"' || { echo "Resposta estranha: $R"; exit 1; }
+echo "resposta: $R"
+echo "Pronto. Ditado local ligado: quem não tem chave do AssemblyAI já transcreve pela VPS."

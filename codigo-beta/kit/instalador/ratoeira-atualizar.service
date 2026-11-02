@@ -1,0 +1,17 @@
+# Atualiza a Ratoeira pela versão nova do produto: ratoeira-atualizar.service (só nas instalações dos alunos).
+# O gateway grava o pedido de um admin (<pedidos>/pedido.json: verificar, aplicar ou voltar) e dá "start" nesta
+# unit (regra do polkit, sem esperar: a atualização reinicia o próprio gateway). Roda como root e termina; o
+# resultado vai pra <pedidos>/resultado.json e o estado pra /var/lib/ratoeira/core/atualizacao.json.
+[Unit]
+Description=Ratoeira - atualizar pela versão nova do produto
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=RATOEIRA_CONFIG=/etc/ratoeira/gateway.config.json
+Environment=RATOEIRA_PEDIDOS_ATUALIZAR=/var/lib/ratoeira/gateway-estado/atualizar
+Environment=RATOEIRA_USUARIO_GATEWAY=ratoeira-gateway
+ExecStart=/usr/local/sbin/ratoeira-atualizar pedido
+# npm ci do gateway e do servidor de agentes: uns minutos
+TimeoutStartSec=1800

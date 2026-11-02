@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Chama uma rota GET do ScrapeCreators com a chave da pessoa ou do time e imprime o JSON.
+# Uso: bash scrapecreators /v1/linkedin/profile url=https://www.linkedin.com/in/fulano [outro=valor ...]
+# Rotas: https://docs.scrapecreators.com/llms.txt (a de cada uma em .../<rota>.md).
+# A chave vai por arquivo temporário pro curl, não aparece na linha de comando.
+set -u
+rota=${1:?uso: scrapecreators /v1/rota chave=valor ...}; shift
+aqui=$(dirname "$0")
+chave=$(bash "$aqui/chave" SCRAPECREATORS_API_KEY) || exit 1
+
+args=()
+for p in "$@"; do args+=(--data-urlencode "$p"); done
+
+tmp=$(mktemp); cab=$(mktemp)
+trap 'rm -f "$tmp" "$cab"' EXIT
+printf 'x-api-key: %s\n' "$chave" > "$cab"
+
+codigo=$(curl -s --max-time 120 --get -H @"$cab" "${args[@]}" -o "$tmp" -w '%{http_code}' \
+  "https://api.scrapecreators.com${rota}")
+
+case "$codigo" in
+  200) cat "$tmp" ;;
+  401) echo "ScrapeCreators 401: chave inválida (confere em app.scrapecreators.com)" >&2; exit 1 ;;
+  402) echo "ScrapeCreators 402: acabaram os créditos (saldo em app.scrapecreators.com)" >&2; exit 1 ;;
+  *)   echo "ScrapeCreators $codigo:" >&2; head -c 500 "$tmp" >&2; echo >&2; exit 1 ;;
+esac

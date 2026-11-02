@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# ffmpeg com freio, pro que roda na VPS da Ratoeira: prioridade mínima de CPU e de disco e no máximo metade dos
+# núcleos, pra não travar o chat de ninguém. Uso: igual ao ffmpeg, com a saída por último.
+#   bash ffmpeg-leve -i entrada.mp4 -c:v libx264 -preset veryfast -crf 23 -c:a aac saida.mp4
+# FFMPEG_THREADS=n muda o número de núcleos (padrão: metade da máquina, no mínimo 1).
+set -u
+[ $# -ge 1 ] || { echo "uso: ffmpeg-leve <opções do ffmpeg> <saída>" >&2; exit 2; }
+n=$(nproc); t=${FFMPEG_THREADS:-$(( n / 2 ))}; [ "$t" -ge 1 ] || t=1
+saida=${!#}
+args=("${@:1:$#-1}")
+# -threads antes da saída vale pro codificador; -filter_threads é global.
+exec nice -n 19 ionice -c 3 ffmpeg -hide_banner -nostdin -filter_threads "$t" "${args[@]}" -threads "$t" "$saida"

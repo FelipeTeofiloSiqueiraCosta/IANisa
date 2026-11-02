@@ -1,0 +1,75 @@
+# Servidor de agentes de uma pessoa: ratoeira-agentes@<usuário Linux>.service
+# Fala ACP com os adaptadores do Claude, do Codex e de outros agentes (agentes/servidor.mjs, em /opt/ratoeira/agentes) e
+# atende o gateway num socket unix em /run/ratoeira-agentes-<usuário>/agentes.sock, que só o grupo
+# do gateway abre. Chat, terminal e Contas de IA da Ratoeira passam por ele (o Paseo por pessoa saiu em 09/10/2026).
+# Sai sozinho depois de 30 min sem ninguém conectado e sem conversa rodando; o gateway liga de novo.
+# Caminhos desta máquina vão num drop-in: /etc/systemd/system/ratoeira-agentes@.service.d/local.conf
+[Unit]
+Description=Ratoeira - agentes de %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+Environment=RATOEIRA_GRUPO=ratoeira-gw
+Environment=AGENTES_DIR=/opt/ratoeira/agentes
+Environment=AGENTES_SOCKET=/run/ratoeira-agentes-%i/agentes.sock
+Environment=AGENTES_OCIOSO_MIN=30
+Environment=PATH=/opt/ratoeira/bin:/usr/local/bin:/usr/bin:/bin
+# O Claude Code é o da máquina (/opt/ratoeira/bin), o mesmo pra todo mundo: quem troca a versão é a
+# atualização da Ratoeira, não ele sozinho.
+Environment=DISABLE_AUTOUPDATER=1
+# Playwright compartilhado (kit/receitas/playwright): biblioteca e navegadores de todo mundo, só leitura.
+Environment=NODE_PATH=/opt/ratoeira/playwright/node_modules
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/ratoeira/ms-playwright
+WorkingDirectory=~
+# Travas: nada de usuário de sistema ou com sudo (o polkit deixa ligar qualquer nome).
+ExecStartPre=+/bin/sh -c 'u=%i; [ "$$(id -u $$u)" -ge 1000 ] && ! id -nG $$u | tr " " "\n" | grep -qxE "sudo|wheel|admin|root"'
+ExecStart=/usr/local/lib/ratoeira/conta-claude /usr/bin/node ${AGENTES_DIR}/servidor.mjs
+# O socket nasce com o umask do processo; o "+" roda como root e entrega pro grupo do gateway.
+ExecStartPost=+/bin/sh -c 'd=/run/ratoeira-agentes-%i; for i in $$(seq 1 60); do [ -S $d/agentes.sock ] && break; sleep 0.5; done; [ -S $d/agentes.sock ] && chgrp ${RATOEIRA_GRUPO} $d $d/agentes.sock && chmod 0660 $d/agentes.sock'
+RuntimeDirectory=ratoeira-agentes-%i
+RuntimeDirectoryMode=0750
+# 0007, não 0077 (19/10/2026): arquivo que o agente faz no /tmp e depois move ou copia pra área leva o modo junto,
+# e com 0077 chegava só do dono e travava o commit do autosync. O grupo de cada pessoa é só ela e a home é 750, então
+# nada abre pros outros; o que é segredo (contas, sessões) o servidor já grava com 0600 explícito.
+UMask=0007
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+# Memória (16/10/2026): piso garantido por pessoa e teto do grupo, no lugar do teto fixo de 1500M, que matava
+# ffmpeg e conversa com a máquina tendo gigas livres. Vale pro servidor E pros agentes abertos (mesmo cgroup).
+# - MemoryLow: a parte de cada um; quando aperta, o kernel tira primeiro de quem está acima da sua.
+# - MemoryHigh: freio suave; passou, o kernel aperta só essa pessoa (fica lenta), sem matar nada.
+# - Teto do grupo de todo mundo (80% da RAM): aplicado aqui ao ligar, porque o publicar-core não instala arquivo de
+#   slice; o resto da máquina (gateway, apps, Docker) fica fora dele. Porcentagem da RAM: o upgrade de máquina já vale.
+# Teto duro só de uma pessoa: drop-in memoria.conf (RATOEIRA_MEMORIA no adicionar-pessoa).
+MemoryLow=12%
+MemoryHigh=45%
+ExecStartPre=+/usr/bin/systemctl set-property --runtime system-ratoeira\\x2dagentes.slice MemoryMax=80%%
+# CPU (28/10/2026): teto do grupo de todo mundo em 60% da máquina (nº de CPUs × 60%), aplicado ao ligar como o
+# da memória. Antes não tinha teto nenhum: um ffmpeg pegava todos os núcleos por minutos, a máquina travava pro
+# resto (gateway, apps) e o provedor da VPS penalizou o uso alto sustentado (a Hostinger mede o total, então
+# prioridade não basta, só teto). Cada pessoa fica com o mesmo peso dentro do grupo (o padrão do cgroup), então o
+# render de uma não deixa o chat das outras lento. Trocar a porcentagem: drop-in com Environment=RATOEIRA_CPU_TETO=<n>.
+# Vídeo e render pesado: skill video-pesado-ratoeira.
+Environment=RATOEIRA_CPU_TETO=60
+ExecStartPre=+/bin/sh -c 'n=$$(nproc); t=$${RATOEIRA_CPU_TETO:-60}; /usr/bin/systemctl set-property --runtime "system-ratoeira\\x2dagentes.slice" CPUQuota=$$((n * t))%%'
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=/home/%i
+ReadWritePaths=/home/%i
+ReadWritePaths=-/srv/ratoeira/areas
+# Conta geral do Codex (aplicar-acessos): o Codex renova o token gravando no arquivo de todos.
+ReadWritePaths=-/var/lib/ratoeira/codex-geral
+# Contas do Codex da organização (desde 28/10/2026; aplicar-acessos cria a pasta, mesmo vazia, antes de as pessoas ligarem).
+ReadWritePaths=-/var/lib/ratoeira/codex-contas
+# Pasta que os apps da Ratoeira dividem com o agente da pessoa (ex.: a pasta de trabalho de um app com chat próprio).
+ReadWritePaths=-/srv/ratoeira/apps
+# Dados dos apps publicados (publicar-app divide com o grupo da área): o agente lê e muda direto, sem ferramenta.
+ReadWritePaths=-/var/lib/ratoeira/apps
+PrivateTmp=yes

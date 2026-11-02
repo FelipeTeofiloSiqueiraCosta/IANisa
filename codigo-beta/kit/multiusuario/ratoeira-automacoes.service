@@ -1,0 +1,16 @@
+# Automações e integrações (automacoes, como root): instala o ~/.config/ratoeira/crontab de cada pessoa
+# como crontab dela, aplica o liga/desliga que o admin pediu na tela e monta o inventário que o admin vê
+# (crons, timers e MCPs de cada um). Roda pelo timer de 1 em 1 minuto e quando o gateway dá "start"
+# (regra do polkit), logo depois de alguém mexer na tela.
+# O padrão é o do produto: o pedido fica em <portal.dataDir>/automacoes-pedido.json, com o estado do gateway em
+# /var/lib/ratoeira/gateway-estado. Máquina com outro caminho ou outro grupo muda pelo drop-in:
+#   /etc/systemd/system/ratoeira-automacoes.service.d/local.conf
+[Unit]
+Description=Ratoeira - automações (instalar crons das pessoas e inventário)
+
+[Service]
+Type=oneshot
+Environment=RATOEIRA_GRUPO=ratoeira-gw
+Environment=RATOEIRA_AUTOMACOES_PEDIDO=/var/lib/ratoeira/gateway-estado/automacoes-pedido.json
+ExecStart=/usr/local/sbin/ratoeira-automacoes
+TimeoutStartSec=120

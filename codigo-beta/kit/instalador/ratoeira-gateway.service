@@ -1,0 +1,30 @@
+# Gateway da Ratoeira (login, portal, apps, chat e terminal pelo servidor de agentes de cada pessoa), como o
+# usuário de sistema ratoeira-gateway, sem sudo e sem home de ninguém. Código em /opt/ratoeira/gateway (atalho pra
+# versão no ar), config em /etc/ratoeira/gateway.config.json, dados em /var/lib/ratoeira. Lê a área do time pelo
+# grupo ratoeira-gw (ACL) e o journal (systemd-journal) pro rastro do botão Reportar.
+# Instalada pelo instalador e trocada pelo atualizador (kit/instalador). A da nossa instância mora em ops/.
+[Unit]
+Description=Ratoeira - portal (login, Mesa, chat e apps)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ratoeira-gateway
+Group=ratoeira-gateway
+SupplementaryGroups=ratoeira-gw systemd-journal
+WorkingDirectory=/opt/ratoeira/gateway
+Environment=RATOEIRA_CONFIG=/etc/ratoeira/gateway.config.json
+ExecStart=/usr/bin/node /opt/ratoeira/gateway/main.mjs
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/ratoeira
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Roda uma rotina da Ratoeira: ratoeira-rotina <id>
+
+Rotina = um pedido pro agente que roda sozinho num horário. Mora em ~/.config/ratoeira/rotinas/<id>.md:
+
+    ---
+    nome: Resumo do dia
+    quando: 0 21 * * 1-5        (cron, no fuso da máquina, como o resto do cron)
+    agente: claude              (claude ou codex)
+    pasta: /srv/ratoeira/areas/time/Clientes
+    avisar: quando-precisar     (sempre, quando-precisar ou so-erro; sem o campo = quando-precisar)
+    ligada: sim
+    ---
+    O pedido, em português, como se fosse no chat.
+
+O cron chama isto pelo invólucro (ratoeira-cron rotina-<id> -- ratoeira-rotina <id>), que guarda início,
+fim, código e saída pra tela de Automações. Aqui: abre o agente na pasta, sem ninguém olhando (Claude em
+--permission-mode auto, Codex em --approve-for-me, os mesmos modos automáticos do chat), e grava qual
+conversa nasceu, com o título "Rotina: <nome> · <data>". A conversa aparece no chat da Ratoeira (o agente
+grava no mesmo lugar que o chat lê), e dá pra abrir e continuar de onde a rotina parou.
+
+Aviso no sino (desde 16/10/2026): no fim, deixa um aviso em ~/.local/state/ratoeira/avisos-rotina/, que o servidor
+de agentes da pessoa entrega pro gateway (sino + celular), só pro dono. Falhou: avisa sempre. O agente pediu
+(última linha "[avisar] <o que precisa>", menos em so-erro): avisa com o pedido. "sempre": avisa toda vez.
+"""
+import json, os, re, subprocess, sys, time
+
+ID_OK = re.compile(r"^[a-z0-9][a-z0-9-]{0,59}$")
+HOME = os.path.expanduser("~")
+ESTADO = os.path.join(HOME, ".local", "state", "ratoeira")
+
+
+def ler_rotina(id_):
+    texto = open(os.path.join(HOME, ".config", "ratoeira", "rotinas", id_ + ".md"), encoding="utf-8").read()
+    m = re.match(r"^---\r?\n(.*?)\r?\n---\r?\n?(.*)$", texto, re.S)
+    if not m: raise SystemExit("rotina sem cabeçalho (--- ... ---)")
+    cab = {}
+    for linha in m.group(1).splitlines():
+        k = re.match(r"^([A-Za-z_]+):\s*(.*)$", linha)
+        if k: cab[k.group(1).lower()] = k.group(2).strip().strip("\"'")
+    return cab, m.group(2).strip()
+
+
+def guardar_json(caminho, dados):
+    os.makedirs(os.path.dirname(caminho), exist_ok=True)
+    tmp = caminho + ".%d.tmp" % os.getpid()
+    with open(tmp, "w") as f: json.dump(dados, f)
+    os.replace(tmp, caminho)
+
+
+MODOS_AVISO = ("sempre", "quando-precisar", "so-erro")
+INSTRUCAO_AVISO = ("\n\n(Ratoeira: esta é uma rotina, roda sem ninguém olhando. Se precisar de uma decisão ou resposta "
+                   "do dono pra seguir, termina a resposta com uma linha \"[avisar] <a pergunta, numa frase>\". "
+                   "Ele recebe o aviso e responde nesta conversa. Se não precisar, não escreve essa linha.)")
+PEDIU = re.compile(r"^\s*\[avisar\]\s*(.+?)\s*$", re.M | re.I)
+
+
+def modo_aviso(cab):
+    m = cab.get("avisar", "").lower().replace("_", "-").replace("ó", "o")
+    return m if m in MODOS_AVISO else "quando-precisar"
+
+
+def aviso_da_execucao(modo, codigo, resposta):
+    """(motivo, texto) do aviso, ou None. Falhou avisa sempre; o pedido do agente vale menos em so-erro."""
+    if codigo: return ("falhou", (resposta or "").strip()[-300:])
+    pedidos = PEDIU.findall(resposta or "") if modo != "so-erro" else []
+    if pedidos: return ("chama", pedidos[-1][:300])
+    if modo == "sempre":
+        linhas = [l.strip() for l in (resposta or "").splitlines() if l.strip()]
+        return ("terminou", (linhas[0] if linhas else "")[:300])
+    return None
+
+
+def deixar_aviso(id_, nome, motivo, texto, agente=None, sessao=None, titulo=None):
+    guardar_json(os.path.join(ESTADO, "avisos-rotina", "%d-%s.json" % (time.time_ns(), id_)),
+                 {"rotina": id_, "nome": nome, "motivo": motivo, "texto": texto, "agente": agente, "sessao": sessao,
+                  "titulo": titulo, "em": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+
+
+def main():
+    if len(sys.argv) != 2 or not ID_OK.match(sys.argv[1]): raise SystemExit("uso: ratoeira-rotina <id>")
+    id_ = sys.argv[1]
+    cab, pedido = ler_rotina(id_)
+    if not pedido: raise SystemExit("rotina sem pedido")
+    pasta = cab.get("pasta") or HOME
+    if not os.path.isdir(pasta): raise SystemExit("pasta não existe: " + pasta)
+    agente = cab.get("agente", "claude").lower()
+    nome = cab.get("nome") or id_
+    titulo = "Rotina: %s · %s" % (nome, time.strftime("%d/%m %H:%M", time.localtime()))
+    modo = modo_aviso(cab)
+    if modo != "so-erro": pedido += INSTRUCAO_AVISO
+    sessao, resposta, codigo = None, "", 1
+    if agente == "codex":
+        cmd = ["codex", "exec", "--json", "--approve-for-me", "--skip-git-repo-check", "-C", pasta]
+        if cab.get("modelo"): cmd += ["-m", cab["modelo"]]
+        r = subprocess.run(cmd + [pedido], capture_output=True, text=True, cwd=pasta)
+        codigo = r.returncode
+        for linha in r.stdout.splitlines():
+            try: ev = json.loads(linha)
+            except ValueError: continue
+            sessao = sessao or ev.get("thread_id") or ev.get("session_id")
+            item = ev.get("item") or {}
+            if item.get("type") in ("agent_message", "assistant_message") and item.get("text"): resposta = item["text"]
+        if r.returncode and r.stderr: print(r.stderr[-4000:], file=sys.stderr)
+    else:
+        cmd = ["claude", "-p", "--output-format", "json", "--permission-mode", cab.get("permissao", "auto")]
+        if cab.get("modelo"): cmd += ["--model", cab["modelo"]]
+        r = subprocess.run(cmd + [pedido], capture_output=True, text=True, cwd=pasta)
+        codigo = r.returncode
+        try:
+            j = json.loads(r.stdout)
+            sessao, resposta = j.get("session_id"), j.get("result") or ""
+            if j.get("is_error"): codigo = codigo or 1
+        except ValueError: resposta = r.stdout
+        if r.returncode and r.stderr: print(r.stderr[-4000:], file=sys.stderr)
+    print(resposta)
+    if sessao:
+        # a conversa ganha o nome da rotina na lista do chat (o servidor de agentes lê este arquivo)
+        arq = os.path.join(ESTADO, "titulos.json")
+        try: titulos = json.load(open(arq))
+        except (OSError, ValueError): titulos = {}
+        titulos["%s:%s" % (agente, sessao)] = titulo
+        guardar_json(arq, titulos)
+        guardar_json(os.path.join(ESTADO, "crons", "rotina-%s.sessao" % id_), {"agente": agente, "sessao": sessao, "pasta": pasta, "titulo": titulo})
+    aviso = aviso_da_execucao(modo, codigo, resposta)
+    if aviso: deixar_aviso(id_, nome, aviso[0], aviso[1], agente, sessao, titulo if sessao else None)
+    sys.exit(codigo)
+
+
+if __name__ == "__main__":
+    try: main()
+    except SystemExit as e:
+        # parou antes de rodar o agente (pasta sumiu, rotina sem pedido…): também é falha, e o dono fica sabendo
+        if isinstance(e.code, str) and len(sys.argv) == 2 and ID_OK.match(sys.argv[1]):
+            nome = sys.argv[1]
+            try: nome = ler_rotina(sys.argv[1])[0].get("nome") or nome
+            except BaseException: pass
+            try: deixar_aviso(sys.argv[1], nome, "falhou", e.code)
+            except OSError: pass
+        raise

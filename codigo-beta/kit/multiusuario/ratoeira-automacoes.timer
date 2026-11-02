@@ -1,0 +1,12 @@
+# De 1 em 1 minuto: o que a pessoa (ou o agente dela) mudou no ~/.config/ratoeira/crontab vale em até 1 min,
+# e a tela de Automações mostra o último resultado de cada uma.
+[Unit]
+Description=Ratoeira - automações a cada minuto
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

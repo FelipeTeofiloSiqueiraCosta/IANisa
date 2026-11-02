@@ -1,0 +1,33 @@
+# Um app da Ratoeira publicado pelo publicar-app: ratoeira-app@<nome>.service
+# Usuário, pastas e travas são fixos aqui; o manifesto só escolhe o comando (script gerado em
+# /opt/ratoeira/apps/<nome>/iniciar), memória, CPU e porta (drop-in ratoeira-app@<nome>.service.d/app.conf).
+# Plano: docs/2026-10-09-publicar-app-sem-sudo.md
+[Unit]
+Description=Ratoeira, app %i
+After=network.target
+
+[Service]
+User=app-%i
+Group=app-%i
+WorkingDirectory=/opt/ratoeira/apps/%i/codigo
+Environment=RATOEIRA_APP=%i RATOEIRA_BASE=/%i DADOS=/var/lib/ratoeira/apps/%i HOME=/var/lib/ratoeira/apps/%i AMBIENTE=/opt/ratoeira/apps/%i/ambiente PYTHONUNBUFFERED=1
+# configuração sem segredo ("ambiente" do manifesto), depois as chaves
+EnvironmentFile=-/opt/ratoeira/apps/%i/ambiente.env
+EnvironmentFile=-/etc/ratoeira/apps/%i/chaves.env
+# o mesmo arquivo que o gateway lê pra assinar a identidade (contrato em docs/2026-10-07-contrato-identidade-apps.md)
+LoadCredential=ratoeira-segredo:/etc/ratoeira/apps/%i/ratoeira.segredo
+ExecStart=/opt/ratoeira/apps/%i/iniciar
+Restart=on-failure
+RestartSec=3
+MemoryMax=512M
+CPUQuota=50%
+# 0007: a pasta de dados é dividida com o time (grupo da área + ACL, publicar-app); o resto da máquina não entra
+UMask=0007
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ratoeira/apps/%i
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

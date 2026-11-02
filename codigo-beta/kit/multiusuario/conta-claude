@@ -1,0 +1,94 @@
+#!/bin/sh
+# Escolhe a conta do Claude e a do Codex da pessoa e roda o comando com elas. Usado pelo servidor
+# de agentes (ratoeira-agentes@), pelas automações e rotinas (ratoeira-cron). Roda como a própria pessoa, já com os grupos dela.
+#   ratoeira-claude-geral: usa sempre uma conta da organização (token de longa duração)
+#   ratoeira-claude (sem o -geral): opcional; a dela (login ou pessoal) ou uma da organização, a que escolher
+#   nenhum dos dois: só as dela (login em Contas de IA ou token pessoal)
+# Quem usa a conta geral consegue ler o token (o agente roda com ele): dar só pra quem confia.
+# CONTA_CLAUDE_*: só pros testes (agentes/test/conta-claude.test.mjs). Mudar não dá acesso a nada: quem
+# roda é a própria pessoa, e ela só lê os tokens que já pode ler.
+T="${CONTA_CLAUDE_GERAL:-/etc/ratoeira/claude-geral.token}"
+grupos=" ${CONTA_CLAUDE_GRUPOS:-$(id -nG)} "
+# Várias contas (desde 10/10/2026): as da organização (/etc/ratoeira/claude-contas/<id>.token, cada uma
+# lida só por quem pode usar, em ordem no contas.tsv), as pessoais (~/.config/ratoeira/claude-contas,
+# tokens de 1 ano que a pessoa mesma adicionou) e o login próprio (~/.claude/.credentials.json). A que a
+# pessoa escolheu fica em ~/.config/ratoeira/claude-conta (org:<id>, pessoal:<id> ou propria), gravada
+# pelo servidor de agentes (agentes/servidor.mjs, contaClaude, que segue esta mesma regra).
+# Sem escolha, ou escolha que não vale mais: login próprio, depois pessoal, depois organização (no modo
+# geral, só organização). Modo propria (fora dos dois grupos) nunca usa conta da organização.
+# Conta pessoal com login completo (desde 16/10/2026): pasta ~/.config/ratoeira/claude-contas/<id>/ com o
+# login dela, entregue como CLAUDE_CONFIG_DIR (o servidor de agentes monta os atalhos pro ~/.claude). Ganha
+# do <id>.token, que é o jeito antigo (só o modelo, sem conectores do claude.ai).
+D="${CONTA_CLAUDE_ORG:-/etc/ratoeira/claude-contas}"
+P="$HOME/.config/ratoeira/claude-contas"
+modo=propria
+case "$grupos" in
+  *" ratoeira-claude-geral "*) modo=geral ;;
+  *" ratoeira-claude "*) modo=opcional ;;
+esac
+propria=0
+# conta própria = login do Claude no arquivo (ele também guarda os logins dos MCPs, então "não vazio" não basta)
+grep -qs '"claudeAiOauth"' "$HOME/.claude/.credentials.json" && propria=1
+id_ok() { case "$1" in ''|*[!a-z0-9]*) return 1 ;; esac; return 0; }
+completa() { grep -qs '"claudeAiOauth"' "$1/.credentials.json"; }
+primeira() {   # primeira conta legível da lista ($1: pasta); pasta com login completo sai como dir:<pasta>
+  [ -r "$1/contas.tsv" ] || return 1
+  while IFS="$(printf '\t')" read -r id _; do
+    id_ok "$id" || continue
+    if [ "$1" = "$P" ] && completa "$1/$id"; then echo "dir:$1/$id"; return 0; fi
+    [ -r "$1/$id.token" ] && { echo "$1/$id.token"; return 0; }
+  done < "$1/contas.tsv"
+  return 1
+}
+org() { [ "$modo" = propria ] && return 1; primeira "$D" || { [ -r "$T" ] && echo "$T"; }; }
+escolha="$(head -c 64 "$HOME/.config/ratoeira/claude-conta" 2>/dev/null)"
+arq=""; ok=0
+case "$escolha" in
+  org:*) id="${escolha#org:}"; id_ok "$id" && [ "$modo" != propria ] && [ -r "$D/$id.token" ] && { arq="$D/$id.token"; ok=1; } ;;
+  pessoal:*) id="${escolha#pessoal:}"
+    if id_ok "$id" && [ "$modo" != geral ]; then
+      if completa "$P/$id"; then arq="dir:$P/$id"; ok=1; elif [ -r "$P/$id.token" ]; then arq="$P/$id.token"; ok=1; fi
+    fi ;;
+  propria) [ "$modo" != geral ] && [ "$propria" = 1 ] && ok=1 ;;
+esac
+if [ "$ok" = 0 ]; then
+  case "$modo" in
+    geral) arq="$(org)" ;;
+    *) [ "$propria" = 1 ] || arq="$(primeira "$P" || org)" ;;
+  esac
+fi
+unset CLAUDE_CONFIG_DIR
+case "$arq" in
+  dir:*) CLAUDE_CONFIG_DIR="${arq#dir:}"; export CLAUDE_CONFIG_DIR; unset CLAUDE_CODE_OAUTH_TOKEN ;;
+  ?*) CLAUDE_CODE_OAUTH_TOKEN="$(cat "$arq")"; export CLAUDE_CODE_OAUTH_TOKEN ;;
+  *) unset CLAUDE_CODE_OAUTH_TOKEN ;;
+esac
+
+# Codex, mesmos três modos (grupos ratoeira-codex e ratoeira-codex-geral). Desde 28/10/2026 são várias contas, como
+# as do Claude, e cada uma é uma pasta de config do Codex (CODEX_HOME) com o login dela: a regra mora no servidor de
+# agentes (agentes/contas-codex.mjs), que diz aqui qual pasta vale pra conta padrão. A própria é o ~/.codex de sempre.
+# Antes, a conta geral entrava virando o ~/.codex/auth.json num atalho pro arquivo de todos (a própria ia pro
+# auth.json.propria): o atalho sai e o login da pessoa volta, que a geral agora é uma conta à parte.
+C="${CONTA_CODEX_GERAL:-/var/lib/ratoeira/codex-geral/auth.json}"
+A="$HOME/.codex/auth.json"
+if [ -L "$A" ] && [ "$(readlink "$A")" = "$C" ]; then
+  rm -f "$A"
+  if [ -f "$A.propria" ]; then mv -f "$A.propria" "$A"; fi
+fi
+unset CODEX_HOME CODEX_SQLITE_HOME
+J="${CONTA_CODEX_MODULO:-${AGENTES_DIR:-/opt/ratoeira/agentes}/contas-codex.mjs}"
+if [ -r "$J" ] && command -v node >/dev/null 2>&1; then
+  eval "$(CONTA_CODEX_GRUPOS="$grupos" node "$J" env 2>/dev/null)"
+fi
+# Cofre de chaves (1Password): quem está no grupo ratoeira-cofre recebe o token da service account
+# do time, e o agente lê as chaves pelas referências op:// sem ninguém colar chave em .env.
+O=/etc/ratoeira/cofre.token
+case "$grupos" in
+  *" ratoeira-cofre "*) if [ -r "$O" ]; then OP_SERVICE_ACCOUNT_TOKEN="$(cat "$O")"; export OP_SERVICE_ACCOUNT_TOKEN; fi ;;
+esac
+# Navegador (playwright-cli, skill navegador-ratoeira): snapshot e print sem --filename vão pra home, fora da
+# pasta de trabalho, pra não virar commit; e o Chrome fecha sozinho depois de 10 min sem comando, pra só
+# ocupar memória enquanto o agente usa. Fica aqui porque a unit não sabe a home da pessoa (%h é /root).
+: "${PLAYWRIGHT_MCP_OUTPUT_DIR:=$HOME/.cache/ratoeira/navegador}" "${PLAYWRIGHT_MCP_IDLE_TIMEOUT:=600000}"
+export PLAYWRIGHT_MCP_OUTPUT_DIR PLAYWRIGHT_MCP_IDLE_TIMEOUT
+exec "$@"

@@ -1,0 +1,691 @@
+{
+  "schemaVersion": 1,
+  "assignmentStatus": "defined",
+  "runtimeEnabled": false,
+  "implementedAgents": [
+    {
+      "id": "lia",
+      "roleId": "social_media",
+      "conversationEnabled": true,
+      "skillExecution": "selected_catalog_instructions_only",
+      "directConnectors": [
+        "higgsfield"
+      ],
+      "connectorExecution": "persistent_agent_connector_permissions",
+      "connectorPermissions": {
+        "higgsfield": "allow"
+      }
+    }
+  ],
+  "scope": "single-company-installation",
+  "updatedAt": "2026-11-02",
+  "purpose": "Distribuição de responsabilidades para implementar os agentes do Marketing; não concede acesso nem executa skills.",
+  "roles": [
+    {
+      "id": "director",
+      "label": "Diretor do time",
+      "exampleName": "Diretor",
+      "kind": "agent",
+      "responsibility": "Planeja, coordena e revisa; consulta o cérebro e delega a execução especializada."
+    },
+    {
+      "id": "social_media",
+      "label": "Social media",
+      "exampleName": "Lia",
+      "kind": "agent",
+      "responsibility": "Pauta, calendário, referências e desempenho do conteúdo orgânico."
+    },
+    {
+      "id": "traffic_manager",
+      "label": "Gestor de tráfego",
+      "exampleName": "Theo",
+      "kind": "agent",
+      "responsibility": "Anúncios, hipóteses de teste, métricas e estratégia de mídia paga."
+    },
+    {
+      "id": "copywriter",
+      "label": "Copywriter",
+      "exampleName": "Cora",
+      "kind": "agent",
+      "responsibility": "Mensagem, argumento, oferta, roteiro escrito, headline e CTA."
+    },
+    {
+      "id": "designer",
+      "label": "Designer",
+      "exampleName": "Duna",
+      "kind": "agent",
+      "responsibility": "Direção de arte, imagens, slides e peças estáticas."
+    },
+    {
+      "id": "web_designer",
+      "label": "Web designer",
+      "exampleName": "Noah",
+      "kind": "agent",
+      "responsibility": "Landing pages e estrutura das páginas do funil."
+    },
+    {
+      "id": "videomaker",
+      "label": "Videomaker",
+      "exampleName": "Vico",
+      "kind": "agent",
+      "responsibility": "Concepção audiovisual, roteiro de cenas, ingestão e imagens de apoio."
+    },
+    {
+      "id": "video_editor",
+      "label": "Editor de vídeo",
+      "exampleName": "Lucas",
+      "kind": "person_or_agent",
+      "responsibility": "Montagem, áudio, legendas, motion e conferência técnica; quando humano, usa as skills pelo assistente de IA."
+    },
+    {
+      "id": "marketing_head",
+      "label": "Head de marketing",
+      "exampleName": "Clara",
+      "kind": "human",
+      "responsibility": "Define objetivos, prioridades e regras; acompanha e aprova os planos."
+    },
+    {
+      "id": "commercial_head",
+      "label": "Head comercial",
+      "exampleName": null,
+      "kind": "human",
+      "responsibility": "Fornece oferta, objeções, preço e metas comerciais; valida essas definições."
+    }
+  ],
+  "sharedContext": [
+    "approved_company_brain",
+    "task_tsk",
+    "approved_briefing",
+    "approved_plan",
+    "approved_dependency_results"
+  ],
+  "skills": [
+    {
+      "id": "extrator-de-marca",
+      "source": ".data/skills/extrator-de-marca/SKILL.md",
+      "label": "Extrator de marca",
+      "primary": [
+        "director"
+      ],
+      "support": [
+        "marketing_head",
+        "commercial_head",
+        "social_media",
+        "copywriter",
+        "designer"
+      ],
+      "purpose": "Entrevistar o usuário e propor o perfil da empresa para conferência.",
+      "dependencies": [
+        "approved_brain_workflow"
+      ],
+      "notes": "Os demais integrantes consultam a marca aprovada; não repetem a entrevista nem alteram regras por conta própria.",
+      "sha256": "67f8a88cf2d9e304286f2ffd667bad69bd986c69f6e191b4f267debe96ca56bb",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "benchmark-de-mercado",
+      "source": ".data/skills/benchmark-de-mercado/SKILL.md",
+      "label": "Benchmark de mercado",
+      "primary": [
+        "director"
+      ],
+      "support": [
+        "social_media",
+        "traffic_manager",
+        "copywriter"
+      ],
+      "purpose": "Consolidar concorrência, posicionamento, ofertas e oportunidades em um diagnóstico estratégico.",
+      "dependencies": [
+        "research_adapter"
+      ],
+      "notes": "Lia pesquisa conteúdo; Theo pesquisa anúncios; Cora interpreta linguagem e ofertas. O diretor consolida e prioriza.",
+      "sha256": "f827794c72417b1c1d1dca5a42747f031846aabba1e8eabac74e52657a3bfc7a",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "texto-humano",
+      "source": ".data/skills/texto-humano/SKILL.md",
+      "label": "Texto humano",
+      "primary": [
+        "copywriter"
+      ],
+      "support": [
+        "social_media",
+        "videomaker",
+        "video_editor",
+        "web_designer",
+        "designer",
+        "director",
+        "marketing_head",
+        "commercial_head"
+      ],
+      "purpose": "Orientar e revisar o texto que será publicado ou falado.",
+      "dependencies": [
+        "instructions_only"
+      ],
+      "notes": "Aplicar ao texto publicável, inclusive texto de imagem e legenda; não transformar todo dado técnico ou conversa interna em copy.",
+      "sha256": "2bc0de51e9bc3f3114d5fcf9ed05607ca0d831a33bb0066aa878386c15a268a0",
+      "runtimeEnabled": false,
+      "reviewer": "director",
+      "aliases": [
+        {
+          "source": ".data/skills/benchmark-system/skills/texto-humano/SKILL.md",
+          "sha256": "1329cc02e53f0c00cd4298a8d64bb2f32b5095bfd220743ac8e4f58249c4463d",
+          "difference": "A mesma metodologia; muda somente o caminho relativo do script verificador."
+        }
+      ]
+    },
+    {
+      "id": "carrossel-modular",
+      "source": ".data/skills/carrossel-modular/SKILL.md",
+      "label": "Carrossel modular",
+      "primary": [
+        "social_media"
+      ],
+      "support": [
+        "copywriter",
+        "designer"
+      ],
+      "purpose": "Coordenar pauta e sequência; Cora escreve; Duna produz os slides.",
+      "dependencies": [
+        "higgsfield_adapter"
+      ],
+      "notes": "Reutilizar briefing e cérebro; o render atual cita Gemini/OpenAI diretos e exige adaptação para usar Higgsfield.",
+      "sha256": "521febd13d14aa87e5703a06d838238d550e10a736bfccd4ac6fd23eb2d204d2",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "criativos-estaticos-que-convertem",
+      "source": ".data/skills/criativos-estaticos-que-convertem/SKILL.md",
+      "label": "Criativos estáticos que convertem",
+      "primary": [
+        "designer"
+      ],
+      "support": [
+        "copywriter",
+        "traffic_manager"
+      ],
+      "purpose": "Produzir peças e variações para anúncios com copy e hipóteses definidas.",
+      "dependencies": [
+        "higgsfield_adapter"
+      ],
+      "notes": "Cora define a mensagem; Theo define público, objetivo e teste; Duna produz. Publicar é outra tarefa.",
+      "sha256": "9cc6513c9bb1abff15b159484b97b08ad40af500fc450c49b040a1648ba339aa",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "benchmark-profile",
+      "source": ".data/skills/benchmark-system/skills/benchmark-profile/SKILL.md",
+      "label": "Benchmark de perfis",
+      "primary": [
+        "social_media"
+      ],
+      "support": [
+        "videomaker",
+        "copywriter"
+      ],
+      "purpose": "Comparar conteúdo orgânico de perfis e compilar inteligência editorial.",
+      "dependencies": [
+        "benchmark_worker",
+        "profile_data"
+      ],
+      "notes": "Orquestra profile-extract, video-download, transcribe e content-analysis; reaproveita os resultados.",
+      "sha256": "ace2c8b8a1e4d96a12f3102b246edf0bc72a072e132ae6eb6dce617b6bf17cc7",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "benchmark-advertiser",
+      "source": ".data/skills/benchmark-system/skills/benchmark-advertiser/SKILL.md",
+      "label": "Benchmark de anunciantes",
+      "primary": [
+        "traffic_manager"
+      ],
+      "support": [
+        "copywriter",
+        "web_designer"
+      ],
+      "purpose": "Comparar anúncios, oferta e caminho até a conversão.",
+      "dependencies": [
+        "benchmark_worker",
+        "meta_ads",
+        "profile_data"
+      ],
+      "notes": "Agrupa ads-extract, funnel-map e offer-analysis. Dados de longevidade não comprovam vendas ou ROAS de concorrentes.",
+      "sha256": "a566bea90c2ec99bde0c86d431939109bb3ab8ebc74dc4a06f65495ba359f5ac",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "capture-reference",
+      "source": ".data/skills/benchmark-system/skills/capture-reference/SKILL.md",
+      "label": "Captura de referências",
+      "primary": [
+        "social_media"
+      ],
+      "support": [
+        "videomaker",
+        "copywriter",
+        "designer",
+        "video_editor"
+      ],
+      "purpose": "Transformar uma referência em pauta e adaptação coerente com a marca.",
+      "dependencies": [
+        "benchmark_worker"
+      ],
+      "notes": "Lia registra e faz o encaixe editorial; vídeo vai para Vico/Lucas, texto para Cora e estático para Duna.",
+      "sha256": "f14349abcdb6fb95c117e9a2ab95649171b462d712c33c7626156900259c1d5b",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "self-review",
+      "source": ".data/skills/benchmark-system/skills/self-review/SKILL.md",
+      "label": "Revisão do desempenho orgânico",
+      "primary": [
+        "social_media"
+      ],
+      "support": [
+        "traffic_manager",
+        "director"
+      ],
+      "purpose": "Comparar os posts próprios e devolver aprendizados sustentados por evidências.",
+      "dependencies": [
+        "benchmark_worker",
+        "profile_data"
+      ],
+      "notes": "Theo cruza resultados quando pertinente. Recomendações não reescrevem automaticamente as regras da empresa.",
+      "sha256": "7562b53094fa0f37117e139207ae71968f93f8c049a748411fc19fe0cfa3d0b8",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "profile-extract",
+      "source": ".data/skills/benchmark-system/skills/profile-extract/SKILL.md",
+      "label": "Extração de perfis",
+      "primary": [
+        "social_media"
+      ],
+      "support": [
+        "traffic_manager"
+      ],
+      "purpose": "Obter dados de perfis e rankings que alimentam a análise orgânica.",
+      "dependencies": [
+        "benchmark_worker",
+        "profile_data"
+      ],
+      "notes": "Acesso a um MCP de anúncios não implica acesso a todas as métricas ou perfis de Instagram/TikTok/YouTube.",
+      "sha256": "0252d889b69c2eb95caee92f369420f3b157d83434025af2029979d82d8cab0c",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "content-analysis",
+      "source": ".data/skills/benchmark-system/skills/content-analysis/SKILL.md",
+      "label": "Análise de conteúdo orgânico",
+      "primary": [
+        "social_media"
+      ],
+      "support": [
+        "copywriter",
+        "videomaker",
+        "designer",
+        "video_editor"
+      ],
+      "purpose": "Analisar gancho, estrutura, retenção e CTA de conteúdo orgânico.",
+      "dependencies": [
+        "analysis_adapter"
+      ],
+      "notes": "O apoio depende do formato. Para anúncio ou landing, usar offer-analysis, preservando a distinção entre orgânico e pago.",
+      "sha256": "1460b3c25b18fe454d736095ccb245ab6ffd23667de5edf26489015a2d6cbf7d",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "ads-extract",
+      "source": ".data/skills/benchmark-system/skills/ads-extract/SKILL.md",
+      "label": "Extração de anúncios",
+      "primary": [
+        "traffic_manager"
+      ],
+      "support": [
+        "copywriter"
+      ],
+      "purpose": "Coletar e organizar anúncios públicos e variações de criativos.",
+      "dependencies": [
+        "benchmark_worker",
+        "meta_ads",
+        "profile_data"
+      ],
+      "notes": "Validar as ferramentas reais expostas pelo MCP. A biblioteca pública não fornece CTR, CPA ou ROAS de concorrentes.",
+      "sha256": "09b3a703a41442b09ea9c64c22f1b49203c002a184b1daff626a7907638b93c3",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "funnel-map",
+      "source": ".data/skills/benchmark-system/skills/funnel-map/SKILL.md",
+      "label": "Mapeamento de funil",
+      "primary": [
+        "web_designer"
+      ],
+      "support": [
+        "traffic_manager",
+        "copywriter",
+        "commercial_head"
+      ],
+      "purpose": "Mapear páginas, objetivo, oferta e a passagem de uma etapa para outra.",
+      "dependencies": [
+        "research_adapter"
+      ],
+      "notes": "Noah estrutura o mapa de páginas; Theo valida origem e objetivo do tráfego; Cora analisa mensagem e CTA. Usar acessos autorizados.",
+      "sha256": "5c1081735683c018d9a6c80c8ad1d15b5469b00edd576495d36f29650849a735",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "offer-analysis",
+      "source": ".data/skills/benchmark-system/skills/offer-analysis/SKILL.md",
+      "label": "Análise de oferta",
+      "primary": [
+        "copywriter"
+      ],
+      "support": [
+        "traffic_manager",
+        "web_designer",
+        "commercial_head"
+      ],
+      "purpose": "Analisar promessa, prova, mecanismo, objeções, preço e condições.",
+      "dependencies": [
+        "instructions_only"
+      ],
+      "notes": "O head comercial confirma os fatos comerciais. Métricas e condições não informadas ficam pendentes.",
+      "sha256": "280212976e94bb35609bee606e2d948a148c48c79ea04b1fc18b41d9aa378ef3",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "video-download",
+      "source": ".data/skills/benchmark-system/skills/video-download/SKILL.md",
+      "label": "Ingestão de vídeo",
+      "primary": [
+        "videomaker"
+      ],
+      "support": [
+        "video_editor",
+        "social_media",
+        "traffic_manager"
+      ],
+      "purpose": "Obter a mídia e os metadados necessários à tarefa.",
+      "dependencies": [
+        "benchmark_worker",
+        "media_tools"
+      ],
+      "notes": "Serviço compartilhado com cache por fonte; a atribuição não libera leitura de cookies ou download fora dos acessos permitidos.",
+      "sha256": "85869a3b38f35e1762e354b591d5ed00fb8f26261f918ec3cff0bf987d1beb18",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "transcribe",
+      "source": ".data/skills/benchmark-system/skills/transcribe/SKILL.md",
+      "label": "Transcrição",
+      "primary": [
+        "videomaker"
+      ],
+      "support": [
+        "video_editor",
+        "social_media",
+        "copywriter"
+      ],
+      "purpose": "Gerar fala com timestamps e alimentar roteiro, análise e montagem.",
+      "dependencies": [
+        "benchmark_worker",
+        "deepgram"
+      ],
+      "notes": "O pacote depende de Deepgram e ferramentas de mídia; não é uma capacidade automaticamente fornecida por Meta/Higgsfield.",
+      "sha256": "ab8bd140ea3d459e1fd2658ca7178dabe99225b10932e5636bc4f9b94257e85b",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "edit-video",
+      "source": ".data/skills/benchmark-system/skills/edit-video/SKILL.md",
+      "label": "Ilha de edição de vídeo",
+      "primary": [
+        "video_editor"
+      ],
+      "support": [
+        "videomaker",
+        "designer"
+      ],
+      "purpose": "Coordenar montagem, plano de edição, render e conferência técnica.",
+      "dependencies": [
+        "benchmark_worker",
+        "media_tools",
+        "deepgram",
+        "remotion",
+        "linux_port"
+      ],
+      "notes": "Quando o editor for humano, recebe a tarefa e usa o assistente de IA. Preservar portões de aprovação já previstos no plano de edição.",
+      "sha256": "dbccc533e8d13f8733d5f233fe1297b3084c63c72f891ef16c6374764ed246aa",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "clean-audio",
+      "source": ".data/skills/benchmark-system/skills/clean-audio/SKILL.md",
+      "label": "Limpeza de áudio",
+      "primary": [
+        "video_editor"
+      ],
+      "support": [
+        "videomaker"
+      ],
+      "purpose": "Diagnosticar e tratar áudio quando necessário.",
+      "dependencies": [
+        "benchmark_worker",
+        "media_tools",
+        "linux_port"
+      ],
+      "notes": "Limpeza que altera a voz exige a escolha de quem aparece no vídeo, como determina o pacote; não aplicar por padrão.",
+      "sha256": "78277b276e8a2daaaec1e5026153e226c6e94db527564788de6b0249aef7ebad",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "remotion-compositor",
+      "source": ".data/skills/benchmark-system/skills/remotion-compositor/SKILL.md",
+      "label": "Motion e composição gráfica",
+      "primary": [
+        "video_editor"
+      ],
+      "support": [
+        "designer",
+        "videomaker"
+      ],
+      "purpose": "Compor legendas, cartões, grafismos e efeitos do plano de edição.",
+      "dependencies": [
+        "benchmark_worker",
+        "remotion",
+        "media_tools",
+        "linux_port"
+      ],
+      "notes": "Duna fornece a direção visual. Higgsfield pode fornecer assets ou áudio quando houver ferramenta compatível, mas não substitui o compositor.",
+      "sha256": "f99f5b739477f91847b75d54a9ebcea74747b834b28d0b0448c5795cfb9e89fe",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "broll-source",
+      "source": ".data/skills/benchmark-system/skills/broll-source/SKILL.md",
+      "label": "Pesquisa de imagens de apoio",
+      "primary": [
+        "videomaker"
+      ],
+      "support": [
+        "video_editor",
+        "designer"
+      ],
+      "purpose": "Selecionar material de apoio e registrar fonte, licença e créditos.",
+      "dependencies": [
+        "benchmark_worker",
+        "licensed_media_sources"
+      ],
+      "notes": "Distinguir material encontrado de material gerado. Não presumir que todo resultado de um banco ou pesquisa pode ser publicado.",
+      "sha256": "5fe4cab32235b5bf44e1ae0555b43f8dd5d5942c16505b57642e45bb3f1dc173",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "omni-insert",
+      "source": ".data/skills/benchmark-system/skills/omni-insert/SKILL.md",
+      "label": "Inserções audiovisuais geradas",
+      "primary": [
+        "videomaker"
+      ],
+      "support": [
+        "video_editor",
+        "designer"
+      ],
+      "purpose": "Criar ou animar planos de apoio e encaixá-los na edição.",
+      "dependencies": [
+        "higgsfield_adapter",
+        "benchmark_worker",
+        "media_tools"
+      ],
+      "notes": "A implementação fornecida usa Gemini Omni diretamente. Requer adaptador para Higgsfield; preservar as verificações de identidade, fala e sincronismo.",
+      "sha256": "5176ab930309908860bd4db36576cbc156304324dba49c451e0d933ff98c171e",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "model-edit",
+      "source": ".data/skills/benchmark-system/skills/model-edit/SKILL.md",
+      "label": "Modelagem de uma edição",
+      "primary": [
+        "video_editor"
+      ],
+      "support": [
+        "videomaker",
+        "designer"
+      ],
+      "purpose": "Medir uma referência e produzir uma receita de edição reproduzível.",
+      "dependencies": [
+        "benchmark_worker",
+        "media_tools",
+        "analysis_adapter"
+      ],
+      "notes": "Medir e registrar procedência; não confundir engenharia reversa de mecanismo com copiar assets do vídeo alheio.",
+      "sha256": "1ce1f33db55c29659b6836f88aa3db1cf6f2a55b8bca1033d1b78fb0e8f72efd",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    },
+    {
+      "id": "style-extract",
+      "source": ".data/skills/benchmark-system/skills/style-extract/SKILL.md",
+      "label": "Extração de estilo de edição",
+      "primary": [
+        "video_editor"
+      ],
+      "support": [
+        "videomaker",
+        "designer"
+      ],
+      "purpose": "Comparar várias referências e propor um estilo com evidência e confiança.",
+      "dependencies": [
+        "benchmark_worker",
+        "media_tools",
+        "analysis_adapter"
+      ],
+      "notes": "Propor mudanças de estilo; não promover automaticamente hipóteses ou alterar a identidade da marca.",
+      "sha256": "5a57dd393566609c12bb052b7874827a2114b28f0623a4484b52c25e8bb9ca3c",
+      "runtimeEnabled": false,
+      "reviewer": "director"
+    }
+  ],
+  "connectors": [
+    {
+      "id": "meta-ads",
+      "label": "Meta Ads",
+      "primary": [
+        "traffic_manager"
+      ],
+      "optionalReadOnly": [
+        "director"
+      ],
+      "consumerRoles": [
+        "marketing_head",
+        "commercial_head",
+        "social_media",
+        "copywriter",
+        "web_designer",
+        "designer",
+        "videomaker",
+        "video_editor"
+      ],
+      "policy": "Os demais consomem relatórios/briefings. Mutações de campanhas e verba são operações separadas e autorizadas; nunca liberadas só pelo vínculo de uma skill.",
+      "runtimeRoleBinding": false
+    },
+    {
+      "id": "higgsfield",
+      "label": "Higgsfield",
+      "primary": [
+        "designer",
+        "videomaker"
+      ],
+      "optional": [
+        "video_editor",
+        "social_media"
+      ],
+      "consumerRoles": [
+        "copywriter",
+        "web_designer",
+        "director",
+        "marketing_head",
+        "commercial_head"
+      ],
+      "policy": "O administrador define os conectores de cada agente e escolhe usar sem perguntar ou pedir confirmação. O Higgsfield da Lia vem liberado para uso sem perguntas repetidas e pode ser alterado ou removido no perfil dela.",
+      "runtimeRoleBinding": [
+        "social_media"
+      ]
+    }
+  ],
+  "bundle": {
+    "source": ".data/skills/benchmark-system",
+    "canonicalSkillsDirectory": ".data/skills/benchmark-system/skills/",
+    "canonicalDefinitionCount": 24,
+    "uniqueCapabilityCount": 23,
+    "mirrorDirectories": [
+      ".data/skills/benchmark-system/.agents/skills",
+      ".data/skills/benchmark-system/.claude/skills"
+    ],
+    "status": "files_on_disk_not_integrated_as_executable_bundle"
+  },
+  "currentLimitations": [
+    "Lia tem conversa persistente, até três skills e conectores configuráveis por agente, com uso liberado ou confirmação por chamada. Outros integrantes, Meta por função e workers permanecem pendentes.",
+    "As 19 skills de benchmark-system estão em disco; o catálogo atual registra os cinco pacotes principais.",
+    "Terminal, scripts e chamadas MCP não são habilitados por este mapeamento.",
+    "Os binários e recursos específicos de macOS exigem adaptação e validação para uma VPS Linux.",
+    "As aprovações de negócio não substituem as permissões de ferramentas do runtime atual."
+  ],
+  "dependencyCatalog": {
+    "approved_brain_workflow": "Entrevista, resumo e confirmação humana do cérebro já existentes; vincular ao futuro diretor.",
+    "research_adapter": "Adaptador autorizado para pesquisa e captura de fontes; não disponível como navegação nativa do chat atual.",
+    "instructions_only": "Instruções de método; não requer executar scripts para orientar o texto ou análise fornecidos.",
+    "higgsfield_adapter": "Adaptar a etapa de geração aos modelos e ferramentas disponíveis no MCP Higgsfield.",
+    "benchmark_worker": "Serviço restrito para executar tarefas técnicas do pacote, ainda não integrado à IANiza.",
+    "profile_data": "Fontes de dados autorizadas, como Apify ou integração por plataforma, ainda não conectadas por este mapa.",
+    "meta_ads": "Meta Ads autenticado e com ferramentas/permissões compatíveis; atribuição por função ainda não implementada.",
+    "analysis_adapter": "Leitura de mídia e análise visual/semântica com provedor apropriado; o pacote usa Gemini opcional.",
+    "media_tools": "Ferramentas de mídia em worker, como FFmpeg, FFprobe e yt-dlp, com limites e validação de URLs.",
+    "deepgram": "Serviço de transcrição usado pelo pacote; exige integração e credenciais próprias.",
+    "remotion": "Compositor e dependências Node do pacote em ambiente de renderização restrito.",
+    "linux_port": "Substituir ou portar recursos de macOS/arm64 e validar o fluxo na VPS Linux.",
+    "licensed_media_sources": "Acesso autorizado a bancos/fontes de mídia com registro de procedência, licença e crédito."
+  }
+}

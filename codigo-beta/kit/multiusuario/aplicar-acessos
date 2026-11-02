@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Aplica quem entra em cada área e as pastas restritas. Roda como root, pela unit
+ratoeira-acessos.service, que o gateway liga (polkit) depois de gravar o estado desejado.
+Precisa ser executável no git (100755): o publicar-core instala com o bit de execução do repo.
+
+O que vem do gateway (RATOEIRA_ACESSOS, JSON) é tratado como pedido, não como ordem:
+- pessoa: só usuários do grupo ratoeira-pessoas (criados pelo adicionar-pessoa.sh), UID >= 1000,
+  sem sudo. O dono da área (quem faz o sync) é gerido pelo criar-area.sh, nunca aqui.
+- área: só as registradas pelo root em /etc/ratoeira/areas.json.
+- pasta restrita: caminho relativo, sem "..", pasta de verdade dentro da área, sem atalho.
+
+Pasta restrita: o grupo da área sai da ACL da pasta (e de tudo dentro); entra cada pessoa
+liberada por nome (u:<usuário>:rwX). Por nome, e não por grupo, porque grupo novo só vale
+depois de religar o servidor de agentes da pessoa; ACL por usuário vale na hora, pra dar e pra tirar.
+O grupo do gateway segue lendo (área Arquivos), e a tela esconde de quem não pode.
+
+Limite conhecido: o histórico do git (.git) continua legível pelo grupo da área. Quem souber
+`git show` lê versões antigas da pasta restrita. Ver IDEIAS.md.
+"""
+import grp, hashlib, json, os, pwd, re, shutil, subprocess, sys
+
+AREAS = "/etc/ratoeira/areas.json"
+APLICADO = "/var/lib/ratoeira-acessos/aplicado.json"
+PESSOAS = "ratoeira-pessoas"
+# Conta do Claude: quem usa o geral (geral ou opcional) lê o token; quem é "geral" usa sempre.
+CLAUDE = "ratoeira-claude"            # lê o token (modos geral e opcional)
+CLAUDE_GERAL = "ratoeira-claude-geral"  # usa o token mesmo tendo conta própria conectada
+TOKEN = "/etc/ratoeira/claude-geral.token"
+# Cofre de chaves (1Password): token de uma service account; quem tem ambiente lê (o conta-claude entrega ao agente).
+COFRE = "ratoeira-cofre"
+COFRE_TOKEN = "/etc/ratoeira/cofre.token"
+COFRE_OK = re.compile(r"^ops_[A-Za-z0-9_+/=.-]{20,4000}$")
+# Ditado do chat: chave do AssemblyAI da organização (Configurações › Organização › Ditado). O grupo das pessoas lê
+# (o servidor de agentes de cada uma, agentes/transcrever.mjs); sem chave o arquivo sai e o ditado usa o motor da VPS.
+DITADO_ENV = "/etc/ratoeira/ditado.env"
+DITADO_OK = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+TOKEN_OK = re.compile(r"^sk-ant-oat01-[A-Za-z0-9_-]{20,300}$")
+# Várias contas do Claude da organização (desde 10/10/2026): um arquivo por conta, root 600 + leitura por
+# ACL só pra quem pode usar (por usuário: vale na hora, sem religar). contas.tsv (id, nome) diz quais existem, em ordem.
+CONTAS_DIR = "/etc/ratoeira/claude-contas"
+CONTAS_TSV = CONTAS_DIR + "/contas.tsv"
+CONTA_ID = re.compile(r"^[a-z0-9]{1,20}$")
+# Conta do Codex, mesmos modos. A geral é um login do ChatGPT num arquivo só, que quem usa lê e
+# grava (o Codex renova o token ali; o conta-claude aponta o ~/.codex/auth.json da pessoa pra ele).
+CODEX = "ratoeira-codex"
+CODEX_GERAL = "ratoeira-codex-geral"
+CODEX_DIR = "/var/lib/ratoeira/codex-geral"
+CODEX_AUTH = CODEX_DIR + "/auth.json"
+CODEX_ID = CODEX_DIR + "/id"
+ID_OK = re.compile(r"^[0-9a-f-]{36}$")
+# Várias contas do Codex da organização (desde 28/10/2026): uma pasta por conta com o login do ChatGPT (auth.json), que só
+# quem pode usar lê e grava por ACL (o Codex renova o token gravando ali e os outros releem). A de id "geral" é o arquivo
+# de antes (CODEX_AUTH). contas.tsv (id, nome) diz quais existem, em ordem. Regra do lado da pessoa: agentes/contas-codex.mjs.
+CODEX_CONTAS = "/var/lib/ratoeira/codex-contas"
+USUARIO = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+SUDO = {"sudo", "wheel", "admin", "root"}
+
+def falha(msg):
+    print(msg, file=sys.stderr); sys.exit(1)
+
+def grupos_de(user):
+    gid = pwd.getpwnam(user).pw_gid
+    return {g.gr_name for g in grp.getgrall() if user in g.gr_mem} | {grp.getgrgid(gid).gr_name}
+
+def pessoa_ok(user):
+    if not USUARIO.match(user): return False
+    try: p = pwd.getpwnam(user)
+    except KeyError: return False
+    g = grupos_de(user)
+    return p.pw_uid >= 1000 and PESSOAS in g and not (g & SUDO)
+
+def setfacl(*args):
+    subprocess.run(["setfacl", *args], check=True)
+
+def contas_codex(contas, modo_de, base=CODEX_CONTAS, geral=CODEX_AUTH, root=True):
+    """Instala as contas do Codex da organização e dá acesso a quem pode usar cada uma: os usuários da lista da conta
+    (ou todos, sem lista), menos quem está no modo "propria". O login só vem no pedido até ser instalado (depois o
+    gateway esquece) e só é gravado se é outro: depois de instalado ele muda sozinho com as renovações, e regravar a
+    cópia do pedido derrubaria todo mundo. Conta que sumiu do pedido sai do disco. Devolve quem precisa religar
+    (quem usa uma conta que ganhou login novo)."""
+    os.makedirs(base, mode=0o755, exist_ok=True)
+    if root: os.chown(base, 0, 0)
+    os.chmod(base, 0o755)
+    validas, religar = [], set()
+    for c in contas[:20]:
+        if not isinstance(c, dict): continue
+        cid = str(c.get("id", ""))
+        if not CONTA_ID.match(cid) or cid in {v for v, _ in validas}: continue
+        nome = re.sub(r"[\t\r\n]+", " ", str(c.get("nome") or "")).strip()[:60] or cid
+        arq = geral if cid == "geral" else os.path.join(base, cid, "auth.json")
+        pasta = os.path.dirname(arq)
+        os.makedirs(pasta, mode=0o750, exist_ok=True)
+        quem = c.get("users")
+        pode = {u for u, m in modo_de.items() if m != "propria" and (not isinstance(quem, list) or u in quem)}
+        auth = c.get("auth")
+        ok = isinstance(auth, dict) and auth.get("auth_mode") == "chatgpt" and isinstance(auth.get("tokens"), dict) and auth["tokens"].get("refresh_token")
+        marca = os.path.join(pasta, "instalado")
+        assinatura = hashlib.sha256(json.dumps(auth, sort_keys=True).encode()).hexdigest() if ok else None
+        try:
+            with open(marca) as f: instalado = f.read().strip()
+        except FileNotFoundError: instalado = None
+        if ok and assinatura != instalado:
+            tmp = arq + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f: json.dump(auth, f, indent=2)
+            os.replace(tmp, arq)
+            with open(marca + ".tmp", "w") as f: f.write(assinatura)
+            os.chmod(marca + ".tmp", 0o600); os.replace(marca + ".tmp", marca)
+            religar |= pode
+        if not os.path.exists(arq):
+            print(f"conta do codex {cid}: sem login no disco nem no pedido"); continue
+        if root:
+            os.chown(pasta, 0, 0); os.chown(arq, 0, 0)
+        # --set troca a ACL inteira de uma vez: ninguém fica sem acesso no meio
+        setfacl("--set", ",".join(["u::rwx", "g::---", "o::---", "m::r-x"] + [f"u:{u}:r-x" for u in sorted(pode)]), pasta)
+        setfacl("--set", ",".join(["u::rw-", "g::---", "o::---", "m::rw-"] + [f"u:{u}:rw-" for u in sorted(pode)]), arq)
+        validas.append((cid, nome))
+    ids = {v for v, _ in validas}
+    for n in os.listdir(base):
+        d = os.path.join(base, n)
+        if CONTA_ID.match(n) and os.path.isdir(d) and n not in ids: shutil.rmtree(d)
+    # a geral de antes (o gateway manda ela na lista como "geral" enquanto existir): tirada da lista, sai do disco
+    if "geral" not in ids:
+        for f in (geral, os.path.join(os.path.dirname(geral), "instalado"), os.path.join(os.path.dirname(geral), "id")):
+            if os.path.exists(f): os.remove(f)
+    tmp = os.path.join(base, "contas.tsv.tmp")
+    with open(tmp, "w") as f: f.write("".join(f"{v}\t{n}\n" for v, n in validas))
+    os.chmod(tmp, 0o644); os.replace(tmp, os.path.join(base, "contas.tsv"))
+    return religar
+
+def pasta_da_area(area, rel):
+    rel = str(rel).strip("/")
+    partes = rel.split("/")
+    if not rel or any(p in ("", ".", "..", ".git") or "\x00" in p for p in partes): return None
+    alvo = os.path.join(area["caminho"], rel)
+    real = os.path.realpath(alvo)
+    if real != alvo or not os.path.isdir(alvo) or not real.startswith(area["caminho"] + "/"): return None
+    return alvo
+
+def restringir(area, alvo, users, gw):
+    g = area["grupo"]
+    # tira o grupo da área e quem já estava liberado por nome; põe só os liberados agora
+    subprocess.run(["setfacl", "-R", "-x", f"g:{g}", alvo], check=False)
+    subprocess.run(["setfacl", "-R", "-d", "-x", f"g:{g}", alvo], check=False)
+    for u in todos_usuarios_pessoas():
+        subprocess.run(["setfacl", "-R", "-x", f"u:{u}", alvo], check=False, stderr=subprocess.DEVNULL)
+        subprocess.run(["setfacl", "-R", "-d", "-x", f"u:{u}", alvo], check=False, stderr=subprocess.DEVNULL)
+    # o dono da área (quem faz o sync com o GitHub) sempre lê e escreve, senão o sync quebra ali
+    dono = [f"u:{area['dono']}:rwX"] if area.get("dono") else []
+    # "outros" zerado: sem o grupo da área, quem é da área cairia em "outros", que em arquivo
+    # antigo (criado com umask 022) ainda lê.
+    regras = [f"u:{u}:rwX" for u in users] + dono + [f"g:{gw}:rX", "m::rwx", "o::---"]
+    setfacl("-R", "-m", ",".join(regras), alvo)
+    subprocess.run(["find", alvo, "-type", "d", "-exec", "setfacl", "-m", ",".join("d:" + r for r in regras), "{}", "+"], check=True)
+
+def liberar(area, alvo, gw):
+    g = area["grupo"]
+    for u in todos_usuarios_pessoas():
+        subprocess.run(["setfacl", "-R", "-x", f"u:{u}", alvo], check=False, stderr=subprocess.DEVNULL)
+        subprocess.run(["setfacl", "-R", "-d", "-x", f"u:{u}", alvo], check=False, stderr=subprocess.DEVNULL)
+    regras = [f"g:{g}:rwX", f"g:{gw}:rX", "m::rwx", "o::---"]
+    setfacl("-R", "-m", ",".join(regras), alvo)
+    subprocess.run(["find", alvo, "-type", "d", "-exec", "setfacl", "-m", ",".join("d:" + r for r in regras), "{}", "+"], check=True)
+
+def todos_usuarios_pessoas():
+    try: return [u for u in grp.getgrnam(PESSOAS).gr_mem if USUARIO.match(u)]
+    except KeyError: return []
+
+def main():
+    gw = os.environ.get("RATOEIRA_GRUPO", "ratoeira-gw")
+    caminho = os.environ.get("RATOEIRA_ACESSOS") or falha("RATOEIRA_ACESSOS não definido")
+    try: areas = {a["id"]: a for a in json.load(open(AREAS))}
+    except FileNotFoundError: areas = {}
+    pedido = json.load(open(caminho))
+    if not isinstance(pedido, dict): falha("pedido inválido")
+
+    # 1. quem entra em cada área (só pessoas da Ratoeira; o resto do grupo fica como está)
+    membros = {aid: set() for aid in areas}
+    for p in pedido.get("pessoas", []):
+        user = p.get("user")
+        if not pessoa_ok(user): print(f"ignorado: {user}"); continue
+        for aid in p.get("areas", []):
+            if aid in membros: membros[aid].add(user)
+    pessoas_ratoeira = set(todos_usuarios_pessoas())
+    mudaram = set()
+    for aid, area in areas.items():
+        atuais = set(grp.getgrnam(area["grupo"]).gr_mem) & pessoas_ratoeira
+        for u in membros[aid] - atuais:
+            subprocess.run(["gpasswd", "-a", u, area["grupo"]], check=True, stdout=subprocess.DEVNULL); mudaram.add(u)
+        for u in atuais - membros[aid]:
+            subprocess.run(["gpasswd", "-d", u, area["grupo"]], check=True, stdout=subprocess.DEVNULL); mudaram.add(u)
+
+    # 1b. conta do Claude: grupos por modo e o arquivo do token
+    for g in (CLAUDE, CLAUDE_GERAL):
+        try: grp.getgrnam(g)
+        except KeyError: subprocess.run(["groupadd", "--system", g], check=True)
+    quer = {CLAUDE: set(), CLAUDE_GERAL: set()}
+    for p in pedido.get("pessoas", []):
+        user = p.get("user")
+        if not pessoa_ok(user): continue
+        modo = p.get("claude", "propria")
+        if modo in ("geral", "opcional"): quer[CLAUDE].add(user)
+        if modo == "geral": quer[CLAUDE_GERAL].add(user)
+    for g, desejado in quer.items():
+        atuais = set(grp.getgrnam(g).gr_mem) & pessoas_ratoeira
+        for u in desejado - atuais:
+            subprocess.run(["gpasswd", "-a", u, g], check=True, stdout=subprocess.DEVNULL); mudaram.add(u)
+        for u in atuais - desejado:
+            subprocess.run(["gpasswd", "-d", u, g], check=True, stdout=subprocess.DEVNULL); mudaram.add(u)
+    token = pedido.get("claudeGeral")
+    if token and TOKEN_OK.match(token):
+        os.makedirs("/etc/ratoeira", mode=0o755, exist_ok=True)
+        tmp = TOKEN + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+        with os.fdopen(fd, "w") as f: f.write(token)
+        os.chown(tmp, 0, grp.getgrnam(CLAUDE).gr_gid); os.chmod(tmp, 0o640); os.replace(tmp, TOKEN)
+    elif not token and os.path.exists(TOKEN) and "claudeContas" not in pedido:
+        os.remove(TOKEN)   # gateway novo (claudeContas): o arquivo antigo só sai depois das contas novas no disco (1b+)
+
+    # 1b+. várias contas do Claude da organização. O token só vem no pedido até ser instalado (depois o
+    # gateway esquece); sem token, o arquivo que já está no disco fica. Quem pode: os usuários da lista da
+    # conta (ou todos, sem lista), menos quem está no modo "propria". Conta que sumiu do pedido sai do disco.
+    contas = pedido.get("claudeContas")
+    if isinstance(contas, list):
+        os.makedirs(CONTAS_DIR, mode=0o755, exist_ok=True)
+        os.chown(CONTAS_DIR, 0, 0); os.chmod(CONTAS_DIR, 0o755)
+        modo_de = {p.get("user"): p.get("claude", "propria") for p in pedido.get("pessoas", []) if pessoa_ok(p.get("user"))}
+        validas = []
+        for c in contas[:20]:
+            if not isinstance(c, dict): continue
+            cid = str(c.get("id", ""))
+            if not CONTA_ID.match(cid) or cid in {v for v, _ in validas}: continue
+            nome = re.sub(r"[\t\r\n]+", " ", str(c.get("nome") or "")).strip()[:60] or cid
+            arq = f"{CONTAS_DIR}/{cid}.token"
+            tk = c.get("token")
+            if isinstance(tk, str) and TOKEN_OK.match(tk):
+                tmp = arq + ".tmp"
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as f: f.write(tk)
+                os.chown(tmp, 0, 0); os.chmod(tmp, 0o600); os.replace(tmp, arq)
+            if not os.path.exists(arq):
+                print(f"conta do claude {cid}: sem token no disco nem no pedido"); continue
+            quem = c.get("users")
+            pode = {u for u, m in modo_de.items() if m != "propria" and (not isinstance(quem, list) or u in quem)}
+            os.chown(arq, 0, 0)
+            # --set troca a ACL inteira de uma vez: ninguém fica sem acesso no meio
+            setfacl("--set", ",".join(["u::rw-", "g::---", "o::---", "m::r--"] + [f"u:{u}:r--" for u in sorted(pode)]), arq)
+            validas.append((cid, nome))
+        ids = {v for v, _ in validas}
+        for f in os.listdir(CONTAS_DIR):
+            if f.endswith(".token") and f[:-6] not in ids: os.remove(os.path.join(CONTAS_DIR, f))
+        tmp = CONTAS_TSV + ".tmp"
+        with open(tmp, "w") as f: f.write("".join(f"{v}\t{n}\n" for v, n in validas))
+        os.chmod(tmp, 0o644); os.replace(tmp, CONTAS_TSV)
+        # a conta geral de antes (um arquivo só) já virou a primeira da lista: o arquivo antigo sai por último
+        if os.path.exists(TOKEN): os.remove(TOKEN)
+
+    # 1b''. cofre de chaves (1Password): com token, todo mundo com ambiente entra no grupo e lê o arquivo;
+    # sem token, o grupo esvazia e o arquivo sai.
+    try: grp.getgrnam(COFRE)
+    except KeyError: subprocess.run(["groupadd", "--system", COFRE], check=True)
+    cofre = pedido.get("cofre")
+    cofre_ok = bool(cofre and COFRE_OK.match(cofre))
+    desejado = {p.get("user") for p in pedido.get("pessoas", []) if pessoa_ok(p.get("user"))} if cofre_ok else set()
+    atuais = set(grp.getgrnam(COFRE).gr_mem) & pessoas_ratoeira
+    for u in desejado - atuais:
+        subprocess.run(["gpasswd", "-a", u, COFRE], check=True, stdout=subprocess.DEVNULL); mudaram.add(u)
+    for u in atuais - desejado:
+        subprocess.run(["gpasswd", "-d", u, COFRE], check=True, stdout=subprocess.DEVNULL); mudaram.add(u)
+    if cofre_ok:
+        os.makedirs("/etc/ratoeira", mode=0o755, exist_ok=True)
+        tmp = COFRE_TOKEN + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+        with os.fdopen(fd, "w") as f: f.write(cofre)
+        os.chown(tmp, 0, grp.getgrnam(COFRE).gr_gid); os.chmod(tmp, 0o640); os.replace(tmp, COFRE_TOKEN)
+    elif os.path.exists(COFRE_TOKEN):
+        os.remove(COFRE_TOKEN)
+
+    # 1b'''. ditado: a chave da organização num arquivo do grupo ratoeira-pessoas (todo mundo com ambiente já está
+    # nele, então vale na hora, sem religar ninguém)
+    ditado = pedido.get("ditado")
+    if ditado and DITADO_OK.match(ditado):
+        try: gid = grp.getgrnam(PESSOAS).gr_gid
+        except KeyError:
+            subprocess.run(["groupadd", "--system", PESSOAS], check=True); gid = grp.getgrnam(PESSOAS).gr_gid
+        os.makedirs("/etc/ratoeira", mode=0o755, exist_ok=True)
+        tmp = DITADO_ENV + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+        with os.fdopen(fd, "w") as f: f.write("ASSEMBLYAI_API_KEY=" + ditado + "\n")
+        os.chown(tmp, 0, gid); os.chmod(tmp, 0o640); os.replace(tmp, DITADO_ENV)
+    elif os.path.exists(DITADO_ENV):
+        os.remove(DITADO_ENV)
+
+    # 1b'. conta do Codex: grupos por modo e o login geral. O login só é instalado quando é novo
+    # (outro id): depois de instalado o arquivo muda sozinho com as renovações, e a cópia do pedido
+    # fica velha. Reinstalar ela derrubaria todo mundo.
+    for g in (CODEX, CODEX_GERAL):
+        try: grp.getgrnam(g)
+        except KeyError: subprocess.run(["groupadd", "--system", g], check=True)
+    quer = {CODEX: set(), CODEX_GERAL: set()}
+    for p in pedido.get("pessoas", []):
+        user = p.get("user")
+        if not pessoa_ok(user): continue
+        modo = p.get("codex", "propria")
+        if modo in ("geral", "opcional"): quer[CODEX].add(user)
+        if modo == "geral": quer[CODEX_GERAL].add(user)
+    for g, desejado in quer.items():
+        atuais = set(grp.getgrnam(g).gr_mem) & pessoas_ratoeira
+        for u in desejado - atuais:
+            subprocess.run(["gpasswd", "-a", u, g], check=True, stdout=subprocess.DEVNULL); mudaram.add(u)
+        for u in atuais - desejado:
+            subprocess.run(["gpasswd", "-d", u, g], check=True, stdout=subprocess.DEVNULL); mudaram.add(u)
+    cg = pedido.get("codexGeral")
+    if isinstance(cg, dict) and ID_OK.match(str(cg.get("id", ""))):
+        try: instalado = open(CODEX_ID).read().strip()
+        except FileNotFoundError: instalado = None
+        auth = cg.get("auth")
+        ok = isinstance(auth, dict) and auth.get("auth_mode") == "chatgpt" and isinstance(auth.get("tokens"), dict) and auth["tokens"].get("refresh_token")
+        if instalado != cg["id"] and ok:
+            gid = grp.getgrnam(CODEX).gr_gid
+            os.makedirs(CODEX_DIR, mode=0o750, exist_ok=True)
+            os.chown(CODEX_DIR, 0, gid); os.chmod(CODEX_DIR, 0o750)
+            tmp = CODEX_AUTH + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o660)
+            with os.fdopen(fd, "w") as f: json.dump(auth, f, indent=2)
+            os.chown(tmp, 0, gid); os.chmod(tmp, 0o660); os.replace(tmp, CODEX_AUTH)
+            with open(CODEX_ID + ".tmp", "w") as f: f.write(cg["id"])
+            os.chmod(CODEX_ID + ".tmp", 0o644); os.replace(CODEX_ID + ".tmp", CODEX_ID)
+            # quem usa a geral precisa religar pra largar o login antigo da memória
+            mudaram |= quer[CODEX]
+        elif instalado != cg["id"]:
+            print("codex geral: pedido sem login novo pra instalar; o que está no disco fica")
+    elif "codexGeral" in pedido and cg is None:   # removida (pedido de gateway antigo não traz a chave)
+        for f in (CODEX_AUTH, CODEX_ID):
+            if os.path.exists(f): os.remove(f)
+
+    # 1d. várias contas do Codex da organização (gateway desde 28/10/2026; o antigo manda só o codexGeral, acima)
+    cx = pedido.get("codexContas")
+    if isinstance(cx, list):
+        modo_cx = {p.get("user"): p.get("codex", "propria") for p in pedido.get("pessoas", []) if pessoa_ok(p.get("user"))}
+        mudaram |= contas_codex(cx, modo_cx)
+
+    # 1c. autor dos commits: o git de cada pessoa assina com o nome e o e-mail da Ratoeira
+    # (commit-turno e qualquer commit que ela ou o agente dela fizerem). Não precisa de conta no GitHub.
+    for p in pedido.get("pessoas", []):
+        user, nome, email = p.get("user"), str(p.get("nome") or ""), str(p.get("email") or "")
+        if not pessoa_ok(user) or not nome or re.search(r"[\x00-\x1f<>]", nome + email) or not re.match(r"^[^@\s]+@[^@\s]+$", email): continue
+        cfg = os.path.join(pwd.getpwnam(user).pw_dir, ".gitconfig")
+        for chave, valor in (("user.name", nome), ("user.email", email)):
+            subprocess.run(["git", "config", "--file", cfg, chave, valor], check=True)
+        os.chown(cfg, pwd.getpwnam(user).pw_uid, pwd.getpwnam(user).pw_gid); os.chmod(cfg, 0o644)
+
+    # 2. pastas restritas. Ordem: primeiro libera as que saíram do pedido, depois restringe as
+    # atuais da mais rasa pra mais funda (a de dentro ganha a própria lista por cima da de fora).
+    # Assim uma pasta liberada que fica dentro de outra ainda restrita volta a ficar restrita.
+    try: antes = json.load(open(APLICADO)).get("restritas", [])
+    except FileNotFoundError: antes = []
+    pedidas = []
+    for r in pedido.get("restritas", []):
+        area = areas.get(r.get("area"))
+        alvo = area and pasta_da_area(area, r.get("pasta", ""))
+        if not alvo: print(f"pasta ignorada: {r.get('area')}/{r.get('pasta')}"); continue
+        pedidas.append((area, alvo, sorted(u for u in r.get("users", []) if u in membros[area["id"]])))
+    chaves = {(a["id"], alvo) for a, alvo, _ in pedidas}
+    for r in antes:
+        area = areas.get(r["area"])
+        alvo = area and pasta_da_area(area, r["pasta"])
+        if alvo and (area["id"], alvo) not in chaves: liberar(area, alvo, gw)
+    agora = []
+    for area, alvo, users in sorted(pedidas, key=lambda x: x[1].count("/")):
+        restringir(area, alvo, users, gw)
+        agora.append({"area": area["id"], "pasta": alvo[len(area["caminho"]) + 1:], "users": users})
+    os.makedirs(os.path.dirname(APLICADO), mode=0o700, exist_ok=True)
+    tmp = APLICADO + ".tmp"
+    json.dump({"restritas": agora}, open(tmp, "w"), indent=1); os.replace(tmp, APLICADO)
+    # quem mudou de grupo precisa religar o servidor de agentes pra valer; o gateway decide quando
+    print(json.dumps({"mudaram": sorted(mudaram)}))
+
+if __name__ == "__main__": main()

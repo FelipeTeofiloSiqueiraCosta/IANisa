@@ -1,0 +1,16 @@
+# Cria uma pessoa na Ratoeira multiusuário: ratoeira-adicionar@<usuário Linux>.service
+# O gateway dá "start" nesta unit quando o admin convida alguém com ambiente próprio (regra do
+# polkit). Roda o adicionar-pessoa.sh como root e termina. É a primeira ação do ajudante de root
+# (passo 5): lista fechada, sem shell livre. "systemctl start" espera acabar e devolve o erro.
+# Caminhos e grupo desta máquina vêm do drop-in:
+#   /etc/systemd/system/ratoeira-adicionar@.service.d/local.conf  (RATOEIRA_GRUPO)
+[Unit]
+Description=Ratoeira - criar a pessoa %i
+
+[Service]
+Type=oneshot
+Environment=RATOEIRA_GRUPO=ratoeira-gw
+# convite só cria usuário novo; nunca reaproveita um que já existe (ver o script)
+Environment=RATOEIRA_SO_NOVO=1
+ExecStart=/usr/local/sbin/ratoeira-adicionar-pessoa %i
+TimeoutStartSec=170

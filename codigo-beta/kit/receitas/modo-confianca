@@ -1,0 +1,87 @@
+#!/bin/bash
+# Modo confiança da Ratoeira (13/10/2026): cada pessoa segue com o seu usuário Linux (commit,
+# conta de IA, home), mas todo mundo tem sudo, e o agente de cada um também. É o "um servidor = um domínio de
+# confiança" do OpenClaw Teams. O modo restrito (sem sudo, pastas restritas) fica guardado pra instalação enterprise.
+#
+# Receita: roda como root pelo chat de um admin (rodar_receita, nome "modo-confianca", args ["ligar"] ou
+# ["desligar"]) ou à mão: sudo ./modo-confianca [ligar|desligar]
+# - ligar: sudo sem senha pro grupo ratoeira-pessoas (todo mundo com ambiente, inclusive quem for convidado
+#   depois) e um drop-in que tira do servidor de agentes as travas que impedem o sudo (NoNewPrivileges,
+#   ProtectSystem, ProtectHome, PrivateTmp). As pastas restritas o gateway desliga sozinho (config "modo").
+# - desligar: tira os dois e volta pro modo restrito do lado do root (no gateway: "modo": "restrito").
+# Cada servidor de agentes religa quando ficar livre (sem conversa, login nem terminal), como no religar-agentes.
+# Idempotente. Confere no fim.
+set -euo pipefail
+[ "$(id -u)" = 0 ] || { echo "Rode com sudo."; exit 1; }
+ACAO=${1:-ligar}
+SUDOERS=/etc/sudoers.d/ratoeira-confianca
+DROPIN_DIR=/etc/systemd/system/ratoeira-agentes@.service.d
+DROPIN=$DROPIN_DIR/confianca.conf
+GRUPO=ratoeira-pessoas
+
+case "$ACAO" in
+  ligar)
+    getent group "$GRUPO" >/dev/null || { echo "PAREI: grupo $GRUPO não existe (nenhuma pessoa criada ainda)."; exit 1; }
+    tmp=$(mktemp)
+    cat > "$tmp" <<EOF
+# Ratoeira, modo confiança (kit/receitas/modo-confianca). Todo mundo com ambiente tem sudo, sem senha:
+# o agente de cada pessoa não tem como digitar senha. Pra desligar: rodar a receita com "desligar".
+%$GRUPO ALL=(ALL:ALL) NOPASSWD: ALL
+EOF
+    visudo -cqf "$tmp" || { rm -f "$tmp"; echo "PAREI: visudo recusou o arquivo."; exit 1; }
+    install -m 440 -o root -g root "$tmp" "$SUDOERS"; rm -f "$tmp"
+    mkdir -p "$DROPIN_DIR"
+    cat > "$DROPIN" <<'EOF'
+# Ratoeira, modo confiança (kit/receitas/modo-confianca): o agente pode usar sudo. Sem isto, o
+# NoNewPrivileges corta o sudo e o ProtectSystem deixa o sistema só leitura até pro root.
+[Service]
+NoNewPrivileges=no
+ProtectSystem=no
+ProtectHome=no
+PrivateTmp=no
+EOF
+    chmod 644 "$DROPIN"
+    ;;
+  desligar)
+    rm -f "$SUDOERS" "$DROPIN"
+    ;;
+  *) echo "uso: modo-confianca [ligar|desligar]"; exit 1 ;;
+esac
+systemctl daemon-reload
+
+# religa cada servidor de agentes ligado, quando ficar livre
+estado(){ curl -s -m 5 --unix-socket "/run/ratoeira-agentes-$1/agentes.sock" http://x/estado || true; }
+livre(){ local e; e=$(estado "$1"); [ -n "$e" ] && echo "$e" | grep -q '"ocupado":false' && echo "$e" | grep -q '"terminais":0'; }
+for un in $(systemctl list-units 'ratoeira-agentes@*' --state=active --no-legend --plain | awk '{print $1}'); do
+  u=${un#ratoeira-agentes@}; u=${u%.service}
+  [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "$u: nome estranho, pulei"; continue; }
+  if livre "$u"; then
+    systemctl stop --no-block "$un"; echo "$u: estava livre, religando agora"
+  else
+    vigia="ratoeira-religar-$u"
+    systemctl stop "$vigia" 2>/dev/null || true
+    systemd-run --quiet --collect --unit="$vigia" /bin/bash -c '
+      u="$1"; un="ratoeira-agentes@$u.service"; s="/run/ratoeira-agentes-$u/agentes.sock"
+      for i in $(seq 1 1440); do
+        systemctl is-active --quiet "$un" || exit 0
+        e=$(curl -s -m 5 --unix-socket "$s" http://x/estado || true)
+        if echo "$e" | grep -q "\"ocupado\":false" && echo "$e" | grep -q "\"terminais\":0"; then systemctl stop "$un"; echo "$u: livre, religado"; exit 0; fi
+        sleep 15
+      done; echo "$u: 6 h ocupado, desisti"' _ "$u"
+    echo "$u: ocupado agora; religa sozinho assim que ficar livre (vigia $vigia)"
+  fi
+done
+
+# confere
+nnp=$(systemctl show 'ratoeira-agentes@conferir.service' -p NoNewPrivileges --value 2>/dev/null || true)
+if [ "$ACAO" = ligar ]; then
+  [ -f "$SUDOERS" ] && [ "$nnp" = no ] || { echo "FALHOU: sudoers ou drop-in não ficaram no lugar (NoNewPrivileges=$nnp)."; exit 1; }
+  for u in $(getent group "$GRUPO" | cut -d: -f4 | tr , ' '); do
+    sudo -l -U "$u" 2>/dev/null | grep -q 'NOPASSWD: ALL' && echo "$u: sudo ok" || { echo "FALHOU: $u sem sudo."; exit 1; }
+  done
+  echo "Modo confiança ligado. Vale pra cada pessoa quando o servidor de agentes dela religar."
+else
+  [ ! -f "$SUDOERS" ] && [ "$nnp" = yes ] || { echo "FALHOU: ainda sobrou o sudoers ou o drop-in (NoNewPrivileges=$nnp)."; exit 1; }
+  echo "Modo confiança desligado (lado do root). No gateway, ponha \"modo\": \"restrito\" na config pra voltar as pastas restritas."
+fi
+echo "Firewall:"; ufw status 2>/dev/null | head -20 || echo "(ufw não instalado)"

@@ -1,0 +1,30 @@
+#!/bin/bash
+# Invólucro das automações da Ratoeira: ratoeira-cron <nome> -- <comando...>
+# Roda o comando como a pessoa (é o cron dela), com o PATH dos CLIs da Ratoeira e as contas do Claude e do
+# Codex dela (conta-claude), e guarda pra tela de Automações:
+#   ~/.local/state/ratoeira/crons/<nome>.json  início, fim, código de saída
+#   ~/.local/state/ratoeira/crons/<nome>.log   a saída, com um cabeçalho por execução (só as últimas ~200 KB)
+# Um comando só (com espaços) vira bash -c, pra caber pipe e redirecionamento na linha do cron.
+nome="$1"; shift
+[ "$1" = "--" ] && shift
+if [ -z "$nome" ] || [ $# -eq 0 ]; then echo "uso: ratoeira-cron <nome> -- <comando...>" >&2; exit 2; fi
+nome=$(printf %s "$nome" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-60)
+dir="${XDG_STATE_HOME:-$HOME/.local/state}/ratoeira/crons"
+mkdir -p -m 700 "$dir"
+export PATH="/opt/ratoeira/bin:/usr/local/bin:/usr/bin:/bin"
+# Playwright compartilhado (kit/receitas/playwright), igual ao servidor de agentes
+export NODE_PATH="/opt/ratoeira/playwright/node_modules" PLAYWRIGHT_BROWSERS_PATH="/opt/ratoeira/ms-playwright"
+inicio=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+printf '{"nome":"%s","inicio":"%s","rodando":true}\n' "$nome" "$inicio" > "$dir/$nome.json.tmp" && mv -f "$dir/$nome.json.tmp" "$dir/$nome.json"
+contas=/usr/local/lib/ratoeira/conta-claude; [ -x "$contas" ] || contas=""
+{
+  echo "=== $inicio"
+  if [ $# -eq 1 ]; then $contas /bin/bash -c "$1"; else $contas "$@"; fi
+} >> "$dir/$nome.log" 2>&1
+codigo=$?
+fim=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+echo "=== fim $fim (saída $codigo)" >> "$dir/$nome.log"
+printf '{"nome":"%s","inicio":"%s","fim":"%s","codigo":%d}\n' "$nome" "$inicio" "$fim" "$codigo" > "$dir/$nome.json.tmp" && mv -f "$dir/$nome.json.tmp" "$dir/$nome.json"
+# log não cresce sem fim: fica o fim dele
+if [ "$(stat -c %s "$dir/$nome.log" 2>/dev/null || echo 0)" -gt 400000 ]; then tail -c 200000 "$dir/$nome.log" > "$dir/$nome.log.tmp" && mv -f "$dir/$nome.log.tmp" "$dir/$nome.log"; fi
+exit $codigo

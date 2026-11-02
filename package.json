@@ -1,0 +1,28 @@
+{
+  "name": "ianiza",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node preview-server.mjs",
+    "build": "node scripts/build.mjs",
+    "start": "node preview-server.mjs",
+    "test": "node --test test/*.test.mjs apresentacao/test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.99.0",
+    "@agentclientprotocol/codex-acp": "2.3.0",
+    "@agentclientprotocol/sdk": "1.7.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "image-size": "2.0.4",
+    "three": "0.180.0",
+    "yauzl": "3.4.0"
+  },
+  "devDependencies": {
+    "@fontsource-variable/manrope": "5.2.8",
+    "esbuild": "0.28.2"
+  }
+}

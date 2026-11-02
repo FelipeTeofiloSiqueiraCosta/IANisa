@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Põe o texto da Ratoeira (agentes.md, ao lado deste script) nas instruções fixas de cada agente
+da máquina, pra todos os usuários. Roda como root: no fim da unit ratoeira-acessos (que o gateway
+liga toda vez que sobe) e no instalador. Idempotente: só grava o que mudou.
+
+- Claude Code: /etc/claude-code/CLAUDE.md, a política gerenciada (vale pra todo usuário e ninguém
+  desliga). O texto vai entre marcas, então o que mais estiver no arquivo fica.
+- Codex: developer_instructions em /etc/codex/managed_config.toml (testado no Codex 0.156.1 com
+  `codex debug prompt-input`). O arquivo é nosso: se existir sem a nossa marca, não mexe e avisa.
+  Desde 28/10/2026 leva também os ganchos do commit-turno (UserPromptSubmit e Stop), como o
+  managed-settings.json faz no Claude: gancho da camada gerenciada roda sem a pessoa aprovar.
+
+- Skills do produto (skills/ ao lado deste script, que o publicar-core instala a partir de kit/skills): atalho
+  em /etc/codex/skills/<nome> (escopo de admin do Codex) e em ~/.claude/skills/<nome> de cada pessoa da
+  Ratoeira (grupo ratoeira-pessoas). No Claude a skill da pasta pessoal vale por cima da do projeto, então a
+  do produto é a que vale; quem quiser outra faz com outro nome. O atalho na casa da pessoa é criado como ela
+  (runuser), nunca como root: a casa é dela, e root seguindo atalho que ela fez escreveria onde ela quisesse.
+  Pasta da pessoa com o mesmo nome que não é atalho nosso: fica a dela.
+
+Agente novo: acrescentar aqui o jeito dele receber instrução fixa. Sem isso ele roda sem saber
+que está na Ratoeira.
+"""
+import glob, grp, json, os, pwd, subprocess, sys
+
+AQUI = os.path.dirname(os.path.realpath(__file__))
+FONTE = os.path.join(AQUI, "agentes.md")
+CLAUDE = "/etc/claude-code/CLAUDE.md"
+CODEX = "/etc/codex/managed_config.toml"
+INICIO, FIM = "<!-- ratoeira:inicio (gerado por ratoeira-instrucoes; não editar aqui) -->", "<!-- ratoeira:fim -->"
+REGISTRO = os.environ.get("RATOEIRA_REGISTRO", "/etc/ratoeira/apps.d")
+MARCA_CODEX = "# gerado por ratoeira-instrucoes; não editar aqui (fonte: agentes.md da Ratoeira)"
+SKILLS = os.path.join(AQUI, "skills")
+SKILLS_CODEX = "/etc/codex/skills"
+COMMIT_TURNO = os.environ.get("RATOEIRA_COMMIT_TURNO", "/usr/local/lib/ratoeira/commit-turno")
+PESSOAS = "ratoeira-pessoas"
+
+def gravar(caminho, conteudo):
+    try:
+        if open(caminho, encoding="utf-8").read() == conteudo: return False
+    except FileNotFoundError: pass
+    os.makedirs(os.path.dirname(caminho), mode=0o755, exist_ok=True)
+    tmp = caminho + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: f.write(conteudo)
+    os.chmod(tmp, 0o644); os.replace(tmp, caminho)
+    return True
+
+def claude(texto):
+    bloco = f"{INICIO}\n{texto.strip()}\n{FIM}\n"
+    try: atual = open(CLAUDE, encoding="utf-8").read()
+    except FileNotFoundError: atual = ""
+    if INICIO.split(" (")[0] in atual and FIM in atual:
+        antes = atual[:atual.index(INICIO.split(" (")[0])]
+        depois = atual[atual.index(FIM) + len(FIM):].lstrip("\n")
+        novo = antes + bloco + (("\n" + depois) if depois else "")
+    else:
+        novo = (atual.rstrip("\n") + "\n\n" if atual.strip() else "") + bloco
+    return gravar(CLAUDE, novo)
+
+def codex(texto):
+    if "'''" in texto: sys.exit("agentes.md não pode ter ''' (quebra o TOML do Codex)")
+    try: atual = open(CODEX, encoding="utf-8").read()
+    except FileNotFoundError: atual = None
+    if atual is not None and MARCA_CODEX not in atual:
+        print(f"{CODEX} existe e não é nosso: Codex ficou sem o texto da Ratoeira", file=sys.stderr); return False
+    ganchos = "".join(f'''
+[[hooks.{ev}]]
+[[hooks.{ev}.hooks]]
+type = "command"
+command = "{COMMIT_TURNO}"
+timeout = 30
+''' for ev in ("UserPromptSubmit", "Stop")) if os.path.exists(COMMIT_TURNO) else ""
+    return gravar(CODEX, f"{MARCA_CODEX}\ndeveloper_instructions = '''\n{texto.strip()}\n'''\n{ganchos}")
+
+def fuso():
+    """O fuso da máquina (o que o cron usa): o atalho /etc/localtime. Uma VPS pode ter sido trocada pra
+    America/Sao_Paulo; o texto dos agentes diz o de verdade, senão a rotina sai horas fora (#239, 27/10/2026)."""
+    try:
+        alvo = os.path.realpath("/etc/localtime")
+        if "/zoneinfo/" in alvo: return alvo.split("/zoneinfo/", 1)[1]
+    except OSError: pass
+    return "UTC"
+
+def apps_publicados():
+    """A seção com os apps publicados pelo publicar-app (registro em apps.d): onde está o código e os dados.
+    O publicar-app roda este script no fim de cada publicação, então app novo já chega no texto."""
+    linhas = []
+    for arq in sorted(glob.glob(os.path.join(REGISTRO, "*.json"))):
+        try: r = json.load(open(arq, encoding="utf-8"))
+        except (OSError, ValueError): continue
+        if not r.get("dados"): continue
+        fonte = f"código em `{r['fonte']}`" if r.get("fonte") else "código em `/opt/ratoeira/apps/" + r["prefix"][1:] + "/codigo`"
+        linhas.append(f"- **{r.get('name') or r['prefix'][1:]}** (`{r['prefix']}/`): {fonte}; dados em `{r['dados']}`.")
+    if not linhas: return ""
+    return ("\n\n## Apps publicados nesta Ratoeira\n\n"
+            "Tu pode ler e mudar os dados destes apps direto (banco SQLite e arquivos na pasta de dados), sem passar pela "
+            "tela nem por ferramenta: a pessoa pede no chat e tu faz. Antes de mexer, leia o código do app (o `agente/AGENTS.md` "
+            "dele, se tiver, as migrações e onde ele lê e grava) pra gravar no formato que ele espera. O app está rodando ao "
+            "mesmo tempo: no SQLite, transação curta e `busy_timeout`; arquivo novo vai pro lugar onde o app procura. "
+            "A tela relê o que mudou sozinha (ou na hora que a pessoa recarregar). Mudança no código do app é na pasta do "
+            "código, no repositório; pra valer, publique de novo.\n\n" + "\n".join(linhas) + "\n")
+
+def skills_do_produto():
+    if not os.path.isdir(SKILLS): return []
+    return sorted(n for n in os.listdir(SKILLS) if os.path.isfile(os.path.join(SKILLS, n, "SKILL.md")))
+
+def nosso(link):
+    return os.path.islink(link) and os.readlink(link).startswith(SKILLS + "/")
+
+def skills_codex(nomes):
+    mudou = 0
+    os.makedirs(SKILLS_CODEX, mode=0o755, exist_ok=True)
+    for n in os.listdir(SKILLS_CODEX):
+        link = os.path.join(SKILLS_CODEX, n)
+        if nosso(link) and n not in nomes: os.remove(link); mudou += 1
+    for n in nomes:
+        link, alvo = os.path.join(SKILLS_CODEX, n), os.path.join(SKILLS, n)
+        if os.path.islink(link) and os.readlink(link) == alvo: continue
+        if os.path.lexists(link) and not nosso(link): continue
+        if os.path.lexists(link): os.remove(link)
+        os.symlink(alvo, link); mudou += 1
+    return mudou
+
+def skills_pessoa(user, nomes):
+    """Atalhos em ~/.claude/skills da pessoa, criados como ela. Olhar (lstat) como root é seguro; escrever, não."""
+    try: casa = pwd.getpwnam(user).pw_dir
+    except KeyError: return 0
+    pasta = os.path.join(casa, ".claude", "skills")
+    script = []
+    for n in nomes:
+        link, alvo = os.path.join(pasta, n), os.path.join(SKILLS, n)
+        if os.path.islink(link) and os.readlink(link) == alvo: continue
+        if os.path.lexists(link) and not nosso(link): continue
+        script.append(f'ln -sfn -- "$1/{n}" "$2/{n}"')
+    if os.path.isdir(pasta) and not os.path.islink(pasta):
+        for n in os.listdir(pasta):
+            if nosso(os.path.join(pasta, n)) and n not in nomes: script.append(f'rm -f -- "$2/{n}"')
+    if not script: return 0
+    cmd = 'set -e; umask 077; mkdir -p -- "$2"; ' + "; ".join(script)
+    r = subprocess.run(["runuser", "-u", user, "--", "sh", "-c", cmd, "sh", SKILLS, pasta], capture_output=True, text=True)
+    if r.returncode != 0: print(f"skills de {user}: {r.stderr.strip()}", file=sys.stderr); return 0
+    return len(script)
+
+def skills():
+    nomes = skills_do_produto()
+    for n in nomes:
+        if not all(c.isalnum() or c in "-_" for c in n): sys.exit(f"nome de skill estranho: {n}")
+    try: pessoas = grp.getgrnam(PESSOAS).gr_mem
+    except KeyError: pessoas = []
+    feitos = skills_codex(nomes) + sum(skills_pessoa(u, nomes) for u in pessoas)
+    return f"skills do produto ({', '.join(nomes) or 'nenhuma'}): " + (f"{feitos} atalho(s) acertado(s)" if feitos else "em dia")
+
+def main():
+    if os.geteuid() != 0: sys.exit("rode como root")
+    texto = open(FONTE, encoding="utf-8").read().rstrip("\n").replace("{{FUSO}}", fuso()) + apps_publicados()
+    mudou = [n for n, f in (("claude", claude), ("codex", codex)) if f(texto)]
+    print("instruções da Ratoeira: " + (("atualizadas em " + ", ".join(mudou)) if mudou else "já em dia"))
+    print(skills())
+
+if __name__ == "__main__": main()

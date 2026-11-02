@@ -1,0 +1,46 @@
+#!/bin/bash
+# Põe as chaves de um app (APPS.md, campo "chaves") em /etc/ratoeira/apps/<app>/chaves.env sem ninguém entrar como root.
+# Quem administra deixa as chaves num arquivo só dele, ~/.config/ratoeira/chaves-apps/<app>.env (NOME=valor por linha,
+# modo 600), e roda esta receita pelo chat (rodar_receita, nome "chaves-app", args [<app>, <usuario>]).
+# A receita junta as chaves no arquivo do app (troca as que já existem, mantém as outras), apaga o arquivo de origem
+# e mostra só os nomes. Depois, publicar o app de novo pra ele ler as chaves.
+# O app precisa ter sido publicado uma vez (é a publicação que cria /etc/ratoeira/apps/<app>).
+set -euo pipefail
+[ "$(id -u)" = 0 ] || { echo "Rode com sudo."; exit 1; }
+APP=${1:-}; DONO=${2:-}
+[[ "$APP" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || { echo "uso: chaves-app <app> <usuario>"; exit 1; }
+[[ "$DONO" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "uso: chaves-app <app> <usuario>"; exit 1; }
+CASA=$(getent passwd "$DONO" | cut -d: -f6)
+[ -n "$CASA" ] || { echo "PAREI: usuário $DONO não existe."; exit 1; }
+ORIGEM="$CASA/.config/ratoeira/chaves-apps/$APP.env"
+DESTINO_DIR="/etc/ratoeira/apps/$APP"
+DESTINO="$DESTINO_DIR/chaves.env"
+
+[ -d "$DESTINO_DIR" ] || { echo "PAREI: $DESTINO_DIR não existe. Publique o app uma vez antes."; exit 1; }
+[ -f "$ORIGEM" ] && [ ! -L "$ORIGEM" ] || { echo "PAREI: não achei $ORIGEM (arquivo comum, não link)."; exit 1; }
+[ "$(stat -c %U "$ORIGEM")" = "$DONO" ] || { echo "PAREI: $ORIGEM não é de $DONO."; exit 1; }
+[ "$(stat -c %a "$ORIGEM")" = 600 ] || { echo "PAREI: $ORIGEM precisa ter modo 600."; exit 1; }
+
+# só linhas NOME=valor com nome em maiúsculas; o resto é ignorado
+NOVAS=$(grep -E '^[A-Z][A-Z0-9_]*=.+' "$ORIGEM" || true)
+[ -n "$NOVAS" ] || { echo "PAREI: $ORIGEM não tem nenhuma linha NOME=valor."; exit 1; }
+
+TMP=$(mktemp "$DESTINO_DIR/.chaves.XXXXXX")
+trap 'rm -f "$TMP"' EXIT
+chmod 600 "$TMP"
+NOMES=$(printf '%s\n' "$NOVAS" | cut -d= -f1)
+# mantém do arquivo atual o que não vai ser trocado
+if [ -f "$DESTINO" ]; then
+  grep -v -E "^($(printf '%s' "$NOMES" | paste -sd'|'))=" "$DESTINO" >> "$TMP" || true
+else
+  echo "# chaves do app (NOME=valor), uma por linha" >> "$TMP"
+fi
+printf '%s\n' "$NOVAS" >> "$TMP"
+chown root:root "$TMP"
+mv "$TMP" "$DESTINO"
+trap - EXIT
+shred -u "$ORIGEM" 2>/dev/null || rm -f "$ORIGEM"
+
+echo "Chaves de $APP gravadas (o arquivo de origem foi apagado):"
+grep -E '^[A-Z][A-Z0-9_]*=' "$DESTINO" | cut -d= -f1 | sed 's/^/  - /'
+[ "$(stat -c '%a %U' "$DESTINO")" = "600 root" ] && echo "Conferido: $DESTINO é do root, modo 600. Publique o app de novo pra ele ler."

@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Gancho do Claude Code e, desde 28/10/2026, do Codex (configuração gerenciada da máquina, vale pra todo usuário:
+/etc/claude-code/managed-settings.json e /etc/codex/managed_config.toml, pelo ratoeira-instrucoes): guarda as versões
+sozinho. No fim de cada resposta do agente, commita no nome de quem pediu o que mudou na pasta de
+trabalho durante a resposta, se ela estiver numa área (/srv/ratoeira/areas/).
+
+Dois momentos (o mesmo script, pelo hook_event_name):
+- UserPromptSubmit (começo do pedido): anota a hora e o que já estava modificado na pasta da conversa,
+  em ~/.local/state/ratoeira/turno/<sessão>.json.
+- Stop (fim da resposta): commita
+    1. o que o agente editou com Edit/Write/MultiEdit/NotebookEdit (em qualquer área), e
+    2. desde 19/10/2026, o que mudou na pasta da conversa durante a resposta por qualquer caminho: arquivo
+       criado, movido ou apagado por comando (mv, rm, rsync, mkdir). Antes isso ficava pro sync, e o agente
+       avisava "ainda não commitei".
+  Do que já estava modificado no começo, só entra o que mudou de novo. Arquivo que existe precisa ser do
+  usuário que roda o agente (ou ter sido editado por ele): numa área do time, o que outra pessoa mexe ao
+  mesmo tempo não sai no nome errado.
+
+- "Quem pediu" é o usuário Linux que roda o agente; nome e e-mail vêm do ~/.gitconfig dele, que o
+  aplicar-acessos grava a partir da Ratoeira. O envio pro GitHub é do sync da área, não daqui.
+- Arquivo acima de 50 MB não entra: antes, o pesados.mjs do servidor de agentes põe ele no .gitignore.
+- `git commit --only`: entra só o que é desta resposta, mesmo com outra pessoa no mesmo repo.
+- Nunca atrapalha o agente: qualquer erro aqui é engolido e sai com 0.
+"""
+import json, os, re, subprocess, sys, time
+
+AREAS = os.environ.get("RATOEIRA_TESTE_AREAS") or "/srv/ratoeira/areas/"   # o teste usa uma pasta temporária
+EDICAO = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+LIMITE = 50 * 1024 * 1024
+PESADOS = "/opt/ratoeira/agentes/pesados.mjs"
+ESTADO = os.path.join(os.path.expanduser("~"), ".local", "state", "ratoeira", "turno")
+
+
+def git(repo, *args, entrada=None):
+    return subprocess.run(["git", "-c", "safe.directory=" + repo, "-C", repo, *args], input=entrada,
+                          capture_output=True, text=True, timeout=20)
+
+
+# Codex (desde 28/10/2026): edição de arquivo vem num patch ("*** Update File: caminho"), às vezes dentro de uma
+# chamada de código, com as quebras de linha ainda escapadas
+PATCH = re.compile(r"\*\*\* (?:(?:Add|Update|Delete) File|Move to): ([^\n\"\\]+)")
+
+
+def textos(v):
+    if isinstance(v, str): yield v
+    elif isinstance(v, dict):
+        for x in v.values(): yield from textos(x)
+    elif isinstance(v, list):
+        for x in v: yield from textos(x)
+
+
+def pedido_e_arquivos_codex(linhas, cwd):
+    """Histórico do Codex (rollout): o último pedido e os arquivos que os patches dele mexeram desde então."""
+    inicio, pedido = 0, ""
+    for i, d in enumerate(linhas):
+        p = d.get("payload") or {}
+        if d.get("type") == "session_meta" and not cwd: cwd = p.get("cwd")
+        if d.get("type") == "event_msg" and p.get("type") == "user_message": inicio, pedido = i, str(p.get("message") or "")
+    arquivos = set()
+    for d in linhas[inicio:]:
+        p = d.get("payload") or {}
+        if d.get("type") != "response_item" or p.get("type") not in ("custom_tool_call", "function_call"): continue
+        for t in textos(p.get("input", p.get("arguments"))):
+            for m in PATCH.finditer(t.replace("\\n", "\n")):
+                caminho = m.group(1).strip()
+                if not caminho.startswith("/") and cwd: caminho = os.path.join(cwd, caminho)
+                if caminho.startswith("/"): arquivos.add(os.path.normpath(caminho))
+    return pedido, arquivos
+
+
+def pedido_e_arquivos(transcript, cwd=None):
+    linhas = []
+    with open(transcript, encoding="utf-8") as f:
+        for linha in f:
+            try: linhas.append(json.loads(linha))
+            except ValueError: pass
+    if any(d.get("type") == "session_meta" for d in linhas[:5]): return pedido_e_arquivos_codex(linhas, cwd)
+    # o último pedido de verdade: mensagem do usuário com texto (não o retorno de uma ferramenta)
+    inicio, pedido = 0, ""
+    for i, d in enumerate(linhas):
+        if d.get("type") != "user": continue
+        c = d.get("message", {}).get("content")
+        if isinstance(c, str): inicio, pedido = i, c
+        elif isinstance(c, list) and any(isinstance(x, dict) and x.get("type") == "text" for x in c) \
+                and not any(isinstance(x, dict) and x.get("type") == "tool_result" for x in c):
+            inicio, pedido = i, " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+    arquivos = set()
+    for d in linhas[inicio:]:
+        if d.get("type") != "assistant": continue
+        for c in d.get("message", {}).get("content") or []:
+            if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("name") in EDICAO:
+                p = (c.get("input") or {}).get("file_path") or (c.get("input") or {}).get("notebook_path")
+                if isinstance(p, str) and p.startswith("/"): arquivos.add(p)
+    return pedido, arquivos
+
+
+def mensagem(pedido):
+    linha = next((l.strip() for l in pedido.splitlines() if l.strip()), "")
+    if not linha or linha.startswith("<"): return "Trabalho do agente"
+    return linha[:72] + ("…" if len(linha) > 72 else "")
+
+
+def topo(pasta):
+    r = git(pasta, "rev-parse", "--show-toplevel")
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def repo_da_conversa(cwd):
+    """A pasta da conversa, se estiver numa área com git: (repo, pasta relativa ao repo, "" = raiz)."""
+    if not cwd: return None, None
+    real = os.path.realpath(cwd)
+    if not real.startswith(AREAS) or not os.path.isdir(real): return None, None
+    repo = topo(real)
+    if not repo: return None, None
+    rel = os.path.relpath(real, repo)
+    return repo, "" if rel == "." else rel
+
+
+def modificados(repo, pasta):
+    """O que o git vê como modificado, novo ou apagado (fora o que o .gitignore esconde), dentro da pasta."""
+    st = git(repo, "status", "--porcelain", "-z", "--untracked-files=all", "--", pasta or ".")
+    if st.returncode != 0: return None
+    itens, partes, i = {}, st.stdout.split("\0"), 0
+    while i < len(partes):
+        item = partes[i]; i += 1
+        if len(item) < 4: continue
+        codigo, caminho = item[:2], item[3:]
+        if codigo[0] in "RC": i += 1   # renomeado no índice: o caminho antigo vem em seguida
+        itens[caminho] = codigo
+    return itens
+
+
+def assinatura(repo, rel):
+    try:
+        s = os.lstat(os.path.join(repo, rel))
+        return f"{s.st_mtime_ns}:{s.st_size}"
+    except OSError:
+        return "-"
+
+
+def arquivo_estado(sessao):
+    if not isinstance(sessao, str) or not re.fullmatch(r"[\w.-]{1,128}", sessao): return None
+    return os.path.join(ESTADO, sessao + ".json")
+
+
+def comecar(ev):
+    arq = arquivo_estado(ev.get("session_id"))
+    if not arq: return
+    repo, pasta = repo_da_conversa(ev.get("cwd"))
+    if not repo:
+        try: os.unlink(arq)
+        except OSError: pass
+        return
+    itens = modificados(repo, pasta)
+    if itens is None: return
+    os.makedirs(ESTADO, mode=0o700, exist_ok=True)
+    dados = {"repo": repo, "pasta": pasta, "inicio": time.time(), "pedido": str(ev.get("prompt") or "")[:500],
+             "sujos": {rel: assinatura(repo, rel) for rel in itens}}
+    tmp = arq + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(dados, f)
+    os.replace(tmp, arq)
+
+
+def mudados_no_turno(estado, editados):
+    """Caminhos (relativos ao repo) que mudaram na pasta da conversa desde o começo do pedido."""
+    repo, pasta = estado["repo"], estado.get("pasta") or ""
+    if os.path.isfile(PESADOS):   # arquivo novo acima de 50 MB vai pro .gitignore antes de olhar o status
+        try: subprocess.run(["node", PESADOS, repo], capture_output=True, timeout=20)
+        except Exception: pass
+    itens = modificados(repo, pasta)
+    if not itens: return []
+    sujos, eu, saida = estado.get("sujos") or {}, os.getuid(), []
+    for rel, codigo in itens.items():
+        sig = assinatura(repo, rel)
+        if rel in sujos and sujos[rel] == sig: continue   # já estava assim antes do pedido
+        if sig != "-":
+            try: s = os.lstat(os.path.join(repo, rel))
+            except OSError: continue
+            if s.st_size > LIMITE: continue
+            if s.st_uid != eu and rel not in editados: continue   # de outra pessoa da área
+        saida.append(rel)
+    return saida
+
+
+def commitar(repo, rels, msg):
+    rels = sorted(set(rels))
+    if not rels: return
+    st = modificados(repo, "")
+    if st is None: return
+    mudados = [r for r in rels if r in st]
+    novos = [r for r in mudados if st[r] == "??"]
+    if not mudados: return
+    lista = "\0".join(mudados) + "\0"
+    # outra pessoa (ou o sync) pode estar com o índice preso: tenta de novo por alguns segundos
+    for _ in range(10):
+        ok = True
+        if novos: ok = git(repo, "add", "--intent-to-add", "--pathspec-from-file=-", "--pathspec-file-nul",
+                           entrada="\0".join(novos) + "\0").returncode == 0
+        if ok and git(repo, "commit", "--only", "--no-verify", "-q", "-m", msg, "--pathspec-from-file=-",
+                      "--pathspec-file-nul", entrada=lista).returncode == 0:
+            break
+        time.sleep(1)
+
+
+def terminar(ev):
+    pedido, arquivos = "", set()
+    tp = ev.get("transcript_path")
+    if tp and os.path.isfile(tp): pedido, arquivos = pedido_e_arquivos(tp, ev.get("cwd"))
+    por_repo = {}
+    for f in arquivos:
+        real = os.path.realpath(f)
+        if not real.startswith(AREAS) or not os.path.exists(real): continue
+        repo = topo(os.path.dirname(real))
+        if repo: por_repo.setdefault(repo, set()).add(os.path.relpath(real, repo))
+    arq = arquivo_estado(ev.get("session_id"))
+    estado = None
+    if arq:
+        try:
+            with open(arq, encoding="utf-8") as f: estado = json.load(f)
+        except (OSError, ValueError): estado = None
+    if estado and estado.get("repo") and os.path.isdir(estado["repo"]):
+        repo = estado["repo"]
+        por_repo.setdefault(repo, set()).update(mudados_no_turno(estado, por_repo.get(repo, set())))
+        pedido = pedido or estado.get("pedido") or ""
+    for repo, rels in por_repo.items(): commitar(repo, rels, mensagem(pedido))
+    if arq:
+        try: os.unlink(arq)
+        except OSError: pass
+
+
+def main():
+    try: ev = json.load(sys.stdin)
+    except ValueError: return
+    # o Codex quer JSON na saída desses ganchos (texto solto vira aviso); o Claude ignora
+    if "turn_id" in ev: print("{}")
+    if ev.get("hook_event_name") == "UserPromptSubmit": comecar(ev)
+    else: terminar(ev)
+
+
+try: main()
+except Exception: pass
+sys.exit(0)

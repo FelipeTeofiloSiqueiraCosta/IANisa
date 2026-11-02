@@ -1,0 +1,17 @@
+# Aplica quem entra em cada área e as pastas restritas (aplicar-acessos), como root.
+# O gateway grava o pedido (RATOEIRA_ACESSOS) e dá "start" aqui (regra do polkit). É uma ação
+# fechada do ajudante de root: o script confere tudo que vem no pedido antes de mexer.
+# O padrão é o do produto: o pedido fica em <portal.dataDir>/contas/acessos.json, com o estado do gateway em
+# /var/lib/ratoeira/gateway-estado. Máquina com outro caminho ou outro grupo muda pelo drop-in:
+#   /etc/systemd/system/ratoeira-acessos.service.d/local.conf
+[Unit]
+Description=Ratoeira - aplicar áreas e pastas restritas
+
+[Service]
+Type=oneshot
+Environment=RATOEIRA_GRUPO=ratoeira-gw
+Environment=RATOEIRA_ACESSOS=/var/lib/ratoeira/gateway-estado/contas/acessos.json
+# Antes, o texto fixo da Ratoeira nas instruções de cada agente (ratoeira-instrucoes); falha nele não para o resto.
+ExecStartPre=-/usr/local/lib/ratoeira/ratoeira-instrucoes
+ExecStart=/usr/local/sbin/ratoeira-aplicar-acessos
+TimeoutStartSec=900

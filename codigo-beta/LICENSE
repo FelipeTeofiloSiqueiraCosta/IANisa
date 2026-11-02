@@ -1,0 +1,19 @@
+Ratoeira: licença de uso do beta fechado
+
+Copyright (c) 2026 DobraLabs. Todos os direitos reservados.
+
+A Ratoeira (o código deste repositório) é software proprietário da DobraLabs.
+
+O que pode: quem recebeu acesso a este repositório durante o beta pode instalar a Ratoeira em servidores
+próprios ou da própria empresa, usar com o seu time e mudar a configuração dela. O que for criado por cima
+(aplicações, skills, rotinas e o conteúdo da pasta de trabalho) é de quem criou.
+
+O que não pode sem autorização por escrito da DobraLabs: copiar ou redistribuir o código, no todo ou em
+parte; publicar este repositório ou uma cópia dele; revender a Ratoeira ou oferecer como serviço pra
+terceiros; remover estes avisos.
+
+Os componentes de terceiros seguem com as licenças deles (kit/AVISOS.md). Claude Code, Codex e os adaptadores
+de agentes são instalados dos repositórios oficiais e seguem os termos de quem os publica.
+
+A Ratoeira é fornecida como está, sem garantia de nenhum tipo. A DobraLabs não responde por perda de dados,
+interrupção ou qualquer dano que venha do uso dela; durante o beta, mantenha cópia do que for importante.

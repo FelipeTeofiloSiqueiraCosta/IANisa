@@ -1,0 +1,24 @@
+# Backup da máquina (backup.py run): restic criptografado pra fora da VPS, com cópia consistente de todo SQLite.
+# Configurado pela tela (Configurações › Segurança › Esta VPS), que liga o timer. Instalado pelo atualizador.
+[Unit]
+Description=Ratoeira - backup criptografado fora da VPS
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStart=/usr/local/sbin/ratoeira-backup run
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUQuota=80%
+MemoryHigh=1500M
+MemoryMax=2G
+TimeoutStartSec=12h
+NoNewPrivileges=true
+# o /tmp de verdade fica visível: não fotografar um namespace privado sem querer
+PrivateTmp=false
+StandardOutput=journal
+StandardError=journal

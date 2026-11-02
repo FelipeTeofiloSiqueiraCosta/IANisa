@@ -1,0 +1,39 @@
+#!/bin/bash
+# SSH só com chave (Configurações › Segurança, desde 28/10/2026): desliga a entrada por senha no SSH.
+# O root continua entrando por chave (é assim que o agente do computador da pessoa entra, kit/instalador/RECEITA.md),
+# a porta 22 fica aberta e o firewall não muda: o SSH nunca fecha, ele é o socorro de quem usa.
+# Para sem mexer em nada se ninguém tiver chave cadastrada ou se a configuração não passar no teste do sshd.
+# Quem chama (o agente) confirma antes com a pessoa que a chave dela entra.
+#   sudo bash ssh-so-chave            liga
+#   sudo bash ssh-so-chave desfazer   volta a aceitar senha
+set -euo pipefail
+[ "$(id -u)" = 0 ] || { echo "Rode com sudo."; exit 1; }
+ARQ=/etc/ssh/sshd_config.d/10-ratoeira-senha.conf
+recarregar(){ systemctl reload ssh 2>/dev/null || systemctl reload sshd; }
+
+if [ "${1:-}" = desfazer ]; then
+  rm -f "$ARQ"; sshd -t && recarregar
+  echo "Desfeito: o SSH volta a aceitar senha (se o resto da configuração deixar)."; exit 0
+fi
+
+# alguém precisa ter chave, senão ninguém entra mais por SSH
+CHAVES=0
+for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+  [ -f "$f" ] && grep -qE '^[^#]*(ssh-(ed25519|rsa|dss)|ecdsa-sha2-|sk-)' "$f" && CHAVES=$((CHAVES+1))
+done
+[ "$CHAVES" -gt 0 ] || { echo "PAREI: nenhuma chave SSH cadastrada nesta VPS. Cadastra a chave do teu computador antes (ssh-copy-id, ou o painel do provedor)."; exit 1; }
+[ -d /etc/ssh/sshd_config.d ] && grep -qiE '^\s*Include\s+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config \
+  || { echo "PAREI: este SSH não lê /etc/ssh/sshd_config.d. Não mexi em nada."; exit 1; }
+
+# 10- vem antes do 50-cloud-init dos provedores, que costuma ligar a senha (no sshd vale o primeiro que define)
+TMP=$(mktemp /etc/ssh/sshd_config.d/.ratoeira.XXXXXX)
+printf '# Ratoeira (Configurações › Segurança): SSH só com chave. Desfazer: ssh-so-chave desfazer\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin prohibit-password\n' > "$TMP"
+chmod 644 "$TMP"; mv "$TMP" "$ARQ"
+if ! sshd -t 2>/tmp/ratoeira-sshd-t.log; then rm -f "$ARQ"; echo "PAREI: o teste do sshd recusou (desfiz):"; cat /tmp/ratoeira-sshd-t.log; exit 1; fi
+recarregar
+
+# confere o que vale de verdade
+T=$(sshd -T 2>/dev/null)
+echo "$T" | grep -qx 'passwordauthentication no' || { echo "PAREI: a senha continua ligada (outra configuração ganha). Veja: sshd -T | grep -i password"; exit 1; }
+echo "$T" | grep -qE '^permitrootlogin (prohibit-password|without-password)$' || echo "Aviso: o root não está entrando por chave ($(echo "$T" | grep '^permitrootlogin'))."
+echo "Pronto: o SSH só aceita chave ($CHAVES arquivo(s) com chave). A porta 22 segue aberta e o root entra por chave."

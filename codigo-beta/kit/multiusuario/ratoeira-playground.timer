@@ -1,0 +1,11 @@
+# De 1 em 1 minuto: a tela de Apps mostra o Playground com no máximo 1 min de atraso.
+[Unit]
+Description=Ratoeira - Playground a cada minuto
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
